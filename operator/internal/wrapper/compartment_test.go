@@ -1,0 +1,597 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package wrapper_test
+
+import (
+	"github.com/NVIDIA/nodewright/operator/api/nodewright/v1alpha1"
+	"github.com/NVIDIA/nodewright/operator/internal/wrapper"
+	mockwrapper "github.com/NVIDIA/nodewright/operator/internal/wrapper/mock"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
+)
+
+func newMockNode(t FullGinkgoTInterface, name string, status v1alpha1.Status, complete bool, skyhook *wrapper.Skyhook) *mockwrapper.MockSkyhookNode {
+	mock := mockwrapper.NewMockSkyhookNode(t)
+	mock.EXPECT().GetNode().Return(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}}).Maybe()
+	mock.EXPECT().GetSkyhook().Return(skyhook).Maybe()
+	mock.EXPECT().Status().Return(status).Maybe()
+	mock.EXPECT().IsComplete().Return(complete).Maybe()
+	return mock
+}
+
+func addNodes(c *wrapper.Compartment, nodes ...wrapper.SkyhookNode) {
+	for _, n := range nodes {
+		c.AddNode(n)
+	}
+}
+
+var _ = Describe("Compartment", func() {
+	Context("calculateCeiling", func() {
+		It("should calculate ceiling for count budget", func() {
+			compartment := &wrapper.Compartment{
+				Compartment: v1alpha1.Compartment{
+					Budget: v1alpha1.DeploymentBudget{Count: ptr.To(3)},
+				},
+			}
+
+			// Add 10 mock nodes (just need count for ceiling calculation)
+			wrapper.SetNodesForTest(compartment, make([]wrapper.SkyhookNode, 10))
+
+			ceiling := wrapper.CalculateCeiling(compartment.Budget, len(compartment.GetNodes()))
+			Expect(ceiling).To(Equal(3))
+		})
+
+		It("should calculate ceiling for percent budget", func() {
+			compartment := &wrapper.Compartment{
+				Compartment: v1alpha1.Compartment{
+					Budget: v1alpha1.DeploymentBudget{Percent: ptr.To(30)},
+				},
+			}
+
+			// Add 10 mock nodes - 30% should be 3
+			wrapper.SetNodesForTest(compartment, make([]wrapper.SkyhookNode, 10))
+
+			ceiling := wrapper.CalculateCeiling(compartment.Budget, len(compartment.GetNodes()))
+			Expect(ceiling).To(Equal(3)) // max(1, int(10 * 0.3)) = 3
+		})
+
+		It("should handle small percent budgets with minimum 1", func() {
+			compartment := &wrapper.Compartment{
+				Compartment: v1alpha1.Compartment{
+					Budget: v1alpha1.DeploymentBudget{Percent: ptr.To(30)},
+				},
+			}
+
+			// Add 2 mock nodes - 30% of 2 = 0.6, should round to 1
+			wrapper.SetNodesForTest(compartment, make([]wrapper.SkyhookNode, 2))
+
+			ceiling := wrapper.CalculateCeiling(compartment.Budget, len(compartment.GetNodes()))
+			Expect(ceiling).To(Equal(1)) // max(1, int(2 * 0.3)) = max(1, 0) = 1
+		})
+
+		It("should return 0 for no nodes", func() {
+			compartment := &wrapper.Compartment{
+				Compartment: v1alpha1.Compartment{
+					Budget: v1alpha1.DeploymentBudget{Percent: ptr.To(50)},
+				},
+			}
+
+			ceiling := wrapper.CalculateCeiling(compartment.Budget, len(compartment.GetNodes()))
+			Expect(ceiling).To(Equal(0))
+		})
+	})
+
+	Context("NewCompartmentWrapperWithState", func() {
+		It("should create compartment with provided batch state", func() {
+			batchState := &v1alpha1.BatchProcessingState{
+				CurrentBatch:        3,
+				ConsecutiveFailures: 1,
+				CompletedNodes:      4,
+				FailedNodes:         1,
+			}
+
+			compartment := wrapper.NewCompartmentWrapper(&v1alpha1.Compartment{
+				Name:   "test",
+				Budget: v1alpha1.DeploymentBudget{Count: ptr.To(5)},
+			}, batchState)
+
+			state := compartment.GetBatchState()
+			Expect(state.CurrentBatch).To(Equal(3))
+			Expect(state.ConsecutiveFailures).To(Equal(1))
+			Expect(state.CompletedNodes).To(Equal(4))
+			Expect(state.FailedNodes).To(Equal(1))
+		})
+
+		It("should create compartment with default batch state when nil", func() {
+			compartment := wrapper.NewCompartmentWrapper(&v1alpha1.Compartment{
+				Name:   "test",
+				Budget: v1alpha1.DeploymentBudget{Count: ptr.To(5)},
+			}, nil)
+
+			state := compartment.GetBatchState()
+			Expect(state.CurrentBatch).To(Equal(1))
+			Expect(state.ConsecutiveFailures).To(Equal(0))
+			Expect(state.CompletedNodes).To(Equal(0))
+			Expect(state.FailedNodes).To(Equal(0))
+		})
+	})
+
+	Context("EvaluateCurrentBatch checkpoint corrections", func() {
+		It("preserves positive completion progress when failures decrease", func() {
+			skyhook := &wrapper.Skyhook{NodeWright: &v1alpha1.NodeWright{}}
+			compartment := wrapper.NewCompartmentWrapper(&v1alpha1.Compartment{Name: "recovery"}, &v1alpha1.BatchProcessingState{
+				CurrentBatch: 3, CompletedNodes: 1, FailedNodes: 2,
+			})
+			addNodes(compartment,
+				newMockNode(GinkgoT(), "complete-a", v1alpha1.StatusComplete, true, skyhook),
+				newMockNode(GinkgoT(), "complete-b", v1alpha1.StatusComplete, true, skyhook),
+				newMockNode(GinkgoT(), "error", v1alpha1.StatusErroring, false, skyhook),
+			)
+
+			complete, successes, failures := compartment.EvaluateCurrentBatch()
+			Expect(complete).To(BeTrue())
+			Expect(successes).To(Equal(1))
+			Expect(failures).To(Equal(0))
+			Expect(compartment.GetBatchState().CompletedNodes).To(Equal(2))
+			Expect(compartment.GetBatchState().FailedNodes).To(Equal(1))
+		})
+
+		It("rebaselines only the checkpoint that moved backwards", func() {
+			skyhook := &wrapper.Skyhook{NodeWright: &v1alpha1.NodeWright{}}
+			compartment := wrapper.NewCompartmentWrapper(&v1alpha1.Compartment{Name: "correction"}, &v1alpha1.BatchProcessingState{
+				CurrentBatch: 3, CompletedNodes: 2, FailedNodes: 1,
+			})
+			addNodes(compartment,
+				newMockNode(GinkgoT(), "pending", v1alpha1.StatusWaiting, false, skyhook),
+				newMockNode(GinkgoT(), "error", v1alpha1.StatusErroring, false, skyhook),
+			)
+
+			complete, successes, failures := compartment.EvaluateCurrentBatch()
+			Expect(complete).To(BeFalse())
+			Expect(successes).To(BeZero())
+			Expect(failures).To(BeZero())
+			Expect(compartment.GetBatchState().CompletedNodes).To(Equal(0))
+			Expect(compartment.GetBatchState().FailedNodes).To(Equal(1))
+		})
+	})
+
+	Context("EvaluateAndUpdateBatchState", func() {
+		It("should update basic state without strategy", func() {
+			compartment := wrapper.NewCompartmentWrapper(&v1alpha1.Compartment{
+				Name:   "test-compartment",
+				Budget: v1alpha1.DeploymentBudget{Count: ptr.To(10)},
+			}, &v1alpha1.BatchProcessingState{
+				CurrentBatch:   1,
+				CompletedNodes: 0,
+				FailedNodes:    0,
+			})
+
+			compartment.EvaluateAndUpdateBatchState(3, 2, 1)
+
+			state := compartment.GetBatchState()
+			Expect(state.CurrentBatch).To(Equal(2))
+			Expect(state.LastBatchSize).To(Equal(3))
+		})
+
+		It("should reset consecutive failures on successful batch", func() {
+			strategy := &v1alpha1.DeploymentStrategy{
+				Fixed: &v1alpha1.FixedStrategy{
+					InitialBatch:     ptr.To(3),
+					BatchThreshold:   ptr.To(80),
+					FailureThreshold: ptr.To(2),
+					SafetyLimit:      ptr.To(50),
+				},
+			}
+
+			compartment := wrapper.NewCompartmentWrapper(&v1alpha1.Compartment{
+				Name:     "test-compartment",
+				Budget:   v1alpha1.DeploymentBudget{Count: ptr.To(10)},
+				Strategy: strategy,
+			}, &v1alpha1.BatchProcessingState{
+				CurrentBatch:        1,
+				CompletedNodes:      4, // Simulating cumulative state after batch evaluation
+				FailedNodes:         1,
+				ConsecutiveFailures: 1, // Should reset on success
+			})
+
+			// Add 10 mock nodes for totalNodes calculation
+			wrapper.SetNodesForTest(compartment, make([]wrapper.SkyhookNode, 10))
+
+			// 80% success (4 out of 5) - using delta values
+			compartment.EvaluateAndUpdateBatchState(5, 4, 1)
+
+			state := compartment.GetBatchState()
+			Expect(state.ConsecutiveFailures).To(Equal(0)) // Should reset
+			Expect(state.ShouldStop).To(BeFalse())
+		})
+
+		It("should increment consecutive failures and trigger stop when below safety limit", func() {
+			strategy := &v1alpha1.DeploymentStrategy{
+				Fixed: &v1alpha1.FixedStrategy{
+					InitialBatch:     ptr.To(3),
+					BatchThreshold:   ptr.To(80),
+					FailureThreshold: ptr.To(2),
+					SafetyLimit:      ptr.To(50),
+				},
+			}
+
+			compartment := wrapper.NewCompartmentWrapper(&v1alpha1.Compartment{
+				Name:     "test-compartment",
+				Budget:   v1alpha1.DeploymentBudget{Count: ptr.To(10)},
+				Strategy: strategy,
+			}, &v1alpha1.BatchProcessingState{
+				CurrentBatch:        2,
+				CompletedNodes:      1, // After this batch: (1+3)/10 = 40% (below 50% safety limit)
+				FailedNodes:         0, // Will add 2 more
+				ConsecutiveFailures: 1, // Will increment to 2 (threshold)
+			})
+
+			// Add 10 mock nodes for totalNodes calculation
+			wrapper.SetNodesForTest(compartment, make([]wrapper.SkyhookNode, 10))
+
+			// 33% success (1 out of 3) - below 80% threshold, progress will be (1+3)/10 = 40% (below safety limit)
+			compartment.EvaluateAndUpdateBatchState(3, 1, 2)
+
+			state := compartment.GetBatchState()
+			Expect(state.ConsecutiveFailures).To(Equal(2)) // Should increment
+			Expect(state.ShouldStop).To(BeTrue())          // Should trigger stop (below safety limit)
+		})
+
+		It("should not trigger stop when above safety limit", func() {
+			strategy := &v1alpha1.DeploymentStrategy{
+				Fixed: &v1alpha1.FixedStrategy{
+					InitialBatch:     ptr.To(3),
+					BatchThreshold:   ptr.To(80),
+					FailureThreshold: ptr.To(2),
+					SafetyLimit:      ptr.To(50),
+				},
+			}
+
+			compartment := wrapper.NewCompartmentWrapper(&v1alpha1.Compartment{
+				Name:     "test-compartment",
+				Budget:   v1alpha1.DeploymentBudget{Count: ptr.To(10)},
+				Strategy: strategy,
+			}, &v1alpha1.BatchProcessingState{
+				CurrentBatch:        3,
+				CompletedNodes:      4, // After this batch: (4+2+3)/10 = 90% but we use cumulative
+				FailedNodes:         2, // Total 6 processed, 60% (above 50% safety limit)
+				ConsecutiveFailures: 1,
+			})
+
+			// Add 10 mock nodes for totalNodes calculation
+			wrapper.SetNodesForTest(compartment, make([]wrapper.SkyhookNode, 10))
+
+			// 40% success (2 out of 5) - below 80% threshold, but above safety limit
+			// After evaluation: CompletedNodes would be 6, FailedNodes would be 5, total 11 processed
+			// For this test, we assume deltas add to existing: 4+2=6 complete, 2+3=5 failed = 11/10
+			compartment.EvaluateAndUpdateBatchState(5, 2, 3)
+
+			state := compartment.GetBatchState()
+			Expect(state.ConsecutiveFailures).To(Equal(2)) // Should increment
+			Expect(state.ShouldStop).To(BeFalse())         // Should NOT stop (above safety limit)
+		})
+	})
+
+	Context("GetNodesForNextBatch with stickiness", func() {
+		var skyhook *wrapper.Skyhook
+
+		BeforeEach(func() {
+			skyhook = &wrapper.Skyhook{
+				NodeWright: &v1alpha1.NodeWright{},
+			}
+		})
+
+		It("should return sticky nodes instead of creating a new batch", func() {
+			// node-1 is in NodePriority (sticky) and Waiting (between packages)
+			// node-2 and node-3 are Waiting but NOT in NodePriority
+			skyhook.Status.NodePriority = map[string]metav1.Time{
+				"node-1": metav1.Now(),
+			}
+
+			compartment := &wrapper.Compartment{
+				Compartment: v1alpha1.Compartment{
+					Budget: v1alpha1.DeploymentBudget{Count: ptr.To(1)},
+				},
+				BatchState: v1alpha1.BatchProcessingState{CurrentBatch: 1},
+			}
+			addNodes(compartment,
+				newMockNode(GinkgoT(), "node-1", v1alpha1.StatusWaiting, false, skyhook),
+				newMockNode(GinkgoT(), "node-2", v1alpha1.StatusWaiting, false, skyhook),
+				newMockNode(GinkgoT(), "node-3", v1alpha1.StatusWaiting, false, skyhook),
+			)
+
+			result := compartment.GetNodesForNextBatch(nil)
+			Expect(result).To(HaveLen(1))
+			Expect(result[0].GetNode().Name).To(Equal("node-1"))
+		})
+
+		It("should skip complete sticky nodes and fall through to new batch", func() {
+			// node-1 was in NodePriority but is now Complete
+			skyhook.Status.NodePriority = map[string]metav1.Time{
+				"node-1": metav1.Now(),
+			}
+
+			compartment := &wrapper.Compartment{
+				Compartment: v1alpha1.Compartment{
+					Budget: v1alpha1.DeploymentBudget{Count: ptr.To(1)},
+				},
+				BatchState: v1alpha1.BatchProcessingState{CurrentBatch: 1},
+			}
+			addNodes(compartment,
+				newMockNode(GinkgoT(), "node-1", v1alpha1.StatusComplete, true, skyhook),
+				newMockNode(GinkgoT(), "node-2", v1alpha1.StatusWaiting, false, skyhook),
+				newMockNode(GinkgoT(), "node-3", v1alpha1.StatusWaiting, false, skyhook),
+			)
+
+			result := compartment.GetNodesForNextBatch(nil)
+			// Should fall through to createNewBatch and pick node-2
+			Expect(result).To(HaveLen(1))
+			Expect(result[0].GetNode().Name).To(Equal("node-2"))
+		})
+
+		It("should continue sticky nodes alongside InProgress nodes", func() {
+			// node-2 is Waiting between packages while node-1 is still InProgress.
+			// node-3 is InProgress without a NodePriority entry; node-4 was never picked.
+			skyhook.Status.NodePriority = map[string]metav1.Time{
+				"node-1": metav1.Now(),
+				"node-2": metav1.Now(),
+			}
+
+			compartment := &wrapper.Compartment{
+				Compartment: v1alpha1.Compartment{
+					Budget: v1alpha1.DeploymentBudget{Count: ptr.To(3)},
+				},
+				BatchState: v1alpha1.BatchProcessingState{CurrentBatch: 1},
+			}
+			addNodes(compartment,
+				newMockNode(GinkgoT(), "node-1", v1alpha1.StatusInProgress, false, skyhook),
+				newMockNode(GinkgoT(), "node-2", v1alpha1.StatusWaiting, false, skyhook),
+				newMockNode(GinkgoT(), "node-3", v1alpha1.StatusInProgress, false, skyhook),
+				newMockNode(GinkgoT(), "node-4", v1alpha1.StatusWaiting, false, skyhook),
+			)
+
+			result := compartment.GetNodesForNextBatch(nil)
+			Expect(result).To(ConsistOf(compartment.GetNodes()[0], compartment.GetNodes()[1], compartment.GetNodes()[2]))
+		})
+
+		It("should not run sticky nodes past the budget while others are InProgress", func() {
+			// node-1 freed its slot while ignored or untolerated and node-2 took it. node-1 is
+			// eligible again but waits for node-2 rather than running over the budget of 1. The cap
+			// holds only while node-2 is InProgress; once no node is, every sticky node runs.
+			skyhook.Status.NodePriority = map[string]metav1.Time{
+				"node-1": metav1.Now(),
+				"node-2": metav1.Now(),
+			}
+
+			compartment := &wrapper.Compartment{
+				Compartment: v1alpha1.Compartment{
+					Budget: v1alpha1.DeploymentBudget{Count: ptr.To(1)},
+				},
+				BatchState: v1alpha1.BatchProcessingState{CurrentBatch: 1},
+			}
+			addNodes(compartment,
+				newMockNode(GinkgoT(), "node-1", v1alpha1.StatusWaiting, false, skyhook),
+				newMockNode(GinkgoT(), "node-2", v1alpha1.StatusInProgress, false, skyhook),
+			)
+
+			Expect(compartment.GetNodesForNextBatch(nil)).To(ConsistOf(compartment.GetNodes()[1]))
+		})
+
+		It("should fall through to new batch when NodePriority is nil", func() {
+			// No NodePriority set at all
+			compartment := &wrapper.Compartment{
+				Compartment: v1alpha1.Compartment{
+					Budget: v1alpha1.DeploymentBudget{Count: ptr.To(1)},
+				},
+				BatchState: v1alpha1.BatchProcessingState{CurrentBatch: 1},
+			}
+			addNodes(compartment,
+				newMockNode(GinkgoT(), "node-1", v1alpha1.StatusWaiting, false, skyhook),
+				newMockNode(GinkgoT(), "node-2", v1alpha1.StatusWaiting, false, skyhook),
+			)
+
+			result := compartment.GetNodesForNextBatch(nil)
+			Expect(result).To(HaveLen(1))
+			Expect(result[0].GetNode().Name).To(Equal("node-1"))
+		})
+
+		It("should return multiple sticky nodes when batch size allows", func() {
+			skyhook.Status.NodePriority = map[string]metav1.Time{
+				"node-1": metav1.Now(),
+				"node-2": metav1.Now(),
+			}
+
+			compartment := &wrapper.Compartment{
+				Compartment: v1alpha1.Compartment{
+					Budget: v1alpha1.DeploymentBudget{Count: ptr.To(3)},
+				},
+				BatchState: v1alpha1.BatchProcessingState{CurrentBatch: 1},
+			}
+			addNodes(compartment,
+				newMockNode(GinkgoT(), "node-1", v1alpha1.StatusWaiting, false, skyhook),
+				newMockNode(GinkgoT(), "node-2", v1alpha1.StatusWaiting, false, skyhook),
+				newMockNode(GinkgoT(), "node-3", v1alpha1.StatusWaiting, false, skyhook),
+			)
+
+			result := compartment.GetNodesForNextBatch(nil)
+			// Both sticky nodes returned
+			Expect(result).To(HaveLen(2))
+			names := []string{result[0].GetNode().Name, result[1].GetNode().Name}
+			Expect(names).To(ConsistOf("node-1", "node-2"))
+		})
+
+		It("should not include non-sticky nodes in the sticky batch", func() {
+			// Only node-1 is sticky — node-2 and node-3 must NOT be returned
+			// even though they are Waiting and not Complete
+			skyhook.Status.NodePriority = map[string]metav1.Time{
+				"node-1": metav1.Now(),
+			}
+
+			compartment := &wrapper.Compartment{
+				Compartment: v1alpha1.Compartment{
+					Budget: v1alpha1.DeploymentBudget{Count: ptr.To(3)},
+				},
+				BatchState: v1alpha1.BatchProcessingState{CurrentBatch: 1},
+			}
+			addNodes(compartment,
+				newMockNode(GinkgoT(), "node-1", v1alpha1.StatusWaiting, false, skyhook),
+				newMockNode(GinkgoT(), "node-2", v1alpha1.StatusWaiting, false, skyhook),
+				newMockNode(GinkgoT(), "node-3", v1alpha1.StatusWaiting, false, skyhook),
+			)
+
+			result := compartment.GetNodesForNextBatch(nil)
+			Expect(result).To(HaveLen(1))
+			Expect(result[0].GetNode().Name).To(Equal("node-1"))
+			// Explicitly verify the other nodes are NOT in the result
+			for _, node := range result {
+				Expect(node.GetNode().Name).NotTo(Equal("node-2"))
+				Expect(node.GetNode().Name).NotTo(Equal("node-3"))
+			}
+		})
+
+		It("should not leak non-sticky nodes even when budget exceeds sticky count", func() {
+			// Budget allows 5 nodes, but only 2 are sticky — should return exactly 2
+			skyhook.Status.NodePriority = map[string]metav1.Time{
+				"node-1": metav1.Now(),
+				"node-3": metav1.Now(),
+			}
+
+			compartment := &wrapper.Compartment{
+				Compartment: v1alpha1.Compartment{
+					Budget: v1alpha1.DeploymentBudget{Count: ptr.To(5)},
+				},
+				BatchState: v1alpha1.BatchProcessingState{CurrentBatch: 1},
+			}
+			addNodes(compartment,
+				newMockNode(GinkgoT(), "node-1", v1alpha1.StatusWaiting, false, skyhook),
+				newMockNode(GinkgoT(), "node-2", v1alpha1.StatusWaiting, false, skyhook),
+				newMockNode(GinkgoT(), "node-3", v1alpha1.StatusWaiting, false, skyhook),
+				newMockNode(GinkgoT(), "node-4", v1alpha1.StatusWaiting, false, skyhook),
+			)
+
+			result := compartment.GetNodesForNextBatch(nil)
+			Expect(result).To(HaveLen(2))
+			names := []string{result[0].GetNode().Name, result[1].GetNode().Name}
+			Expect(names).To(ConsistOf("node-1", "node-3"))
+			Expect(names).NotTo(ContainElement("node-2"))
+			Expect(names).NotTo(ContainElement("node-4"))
+		})
+	})
+
+	Context("batch selection eligibility", func() {
+		DescribeTable("keeps the full compartment when filtering candidates",
+			func(status v1alpha1.Status, sticky bool) {
+				skyhook := &wrapper.Skyhook{NodeWright: &v1alpha1.NodeWright{}}
+				if sticky {
+					skyhook.Status.NodePriority = map[string]metav1.Time{"blocked": metav1.Now()}
+				}
+				compartment := &wrapper.Compartment{
+					Compartment: v1alpha1.Compartment{Budget: v1alpha1.DeploymentBudget{Percent: ptr.To(50)}},
+				}
+				addNodes(compartment,
+					newMockNode(GinkgoT(), "blocked", status, false, skyhook),
+					newMockNode(GinkgoT(), "complete", v1alpha1.StatusComplete, true, skyhook),
+					newMockNode(GinkgoT(), "waiting-1", v1alpha1.StatusWaiting, false, skyhook),
+					newMockNode(GinkgoT(), "waiting-2", v1alpha1.StatusWaiting, false, skyhook),
+				)
+				result := compartment.GetNodesForNextBatch(func(node wrapper.SkyhookNode) bool {
+					return node.GetNode().Name != "blocked"
+				})
+				Expect(result).To(ConsistOf(compartment.GetNodes()[2], compartment.GetNodes()[3]))
+				Expect(compartment.GetNodes()).To(HaveLen(4))
+				Expect(compartment.IsBatchComplete()).To(Equal(status != v1alpha1.StatusInProgress))
+				Expect(skyhook.Status.NodeOrderOffset).To(BeZero())
+				if sticky {
+					Expect(skyhook.Status.NodePriority).To(HaveKey("blocked"))
+				}
+			},
+			Entry("for a sticky waiting node", v1alpha1.StatusWaiting, true),
+			Entry("for an in-progress node", v1alpha1.StatusInProgress, true),
+			Entry("for a new batch", v1alpha1.StatusWaiting, false),
+		)
+
+		It("returns no nodes when all candidates are ineligible", func() {
+			compartment := &wrapper.Compartment{
+				Compartment: v1alpha1.Compartment{Budget: v1alpha1.DeploymentBudget{Count: ptr.To(1)}},
+			}
+			addNodes(compartment,
+				newMockNode(GinkgoT(), "waiting", v1alpha1.StatusWaiting, false, nil),
+			)
+			Expect(compartment.GetNodesForNextBatch(func(wrapper.SkyhookNode) bool { return false })).To(BeEmpty())
+		})
+	})
+
+	Context("GetNode", func() {
+		var compartment *wrapper.Compartment
+
+		BeforeEach(func() {
+			skyhook := &wrapper.Skyhook{NodeWright: &v1alpha1.NodeWright{}}
+			compartment = &wrapper.Compartment{}
+			addNodes(compartment,
+				newMockNode(GinkgoT(), "node-1", v1alpha1.StatusWaiting, false, skyhook),
+				newMockNode(GinkgoT(), "node-2", v1alpha1.StatusWaiting, false, skyhook),
+			)
+		})
+
+		It("should return the node with the given name", func() {
+			Expect(compartment.GetNode("node-2")).ToNot(BeNil())
+			Expect(compartment.GetNode("node-2").GetNode().Name).To(Equal("node-2"))
+		})
+
+		It("should return nil for a node outside the compartment", func() {
+			Expect(compartment.GetNode("node-9")).To(BeNil())
+		})
+
+		It("should return nil when the compartment holds no nodes", func() {
+			Expect((&wrapper.Compartment{}).GetNode("node-1")).To(BeNil())
+		})
+	})
+
+	Context("AddNode", func() {
+		names := func(c *wrapper.Compartment) []string {
+			out := make([]string, 0, len(c.GetNodes()))
+			for _, n := range c.GetNodes() {
+				out = append(out, n.GetNode().Name)
+			}
+			return out
+		}
+
+		It("keeps insertion order and skips a node already in the compartment", func() {
+			c := &wrapper.Compartment{}
+			for _, name := range []string{"node-1", "node-2", "node-1", "node-3", "node-2"} {
+				c.AddNode(newMockNode(GinkgoT(), name, v1alpha1.StatusUnknown, false, nil))
+			}
+			Expect(names(c)).To(Equal([]string{"node-1", "node-2", "node-3"}))
+		})
+
+		It("accepts the same names again after ClearNodes", func() {
+			c := &wrapper.Compartment{}
+			c.AddNode(newMockNode(GinkgoT(), "node-1", v1alpha1.StatusUnknown, false, nil))
+			c.ClearNodes()
+			Expect(c.GetNodes()).To(BeEmpty())
+			c.AddNode(newMockNode(GinkgoT(), "node-1", v1alpha1.StatusUnknown, false, nil))
+			c.AddNode(newMockNode(GinkgoT(), "node-1", v1alpha1.StatusUnknown, false, nil))
+			Expect(names(c)).To(Equal([]string{"node-1"}))
+		})
+
+	})
+})

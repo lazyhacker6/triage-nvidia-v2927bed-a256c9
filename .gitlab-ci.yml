@@ -1,0 +1,287 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+default:
+  tags:
+     - baseos-infra
+  image: gitlab-master.nvidia.com:5005/dgx/infra/skyhook-operator/ci:latest ## TODO: this is no longer getting updated, we need to address this
+
+variables:
+  KUBERNETES_CPU_LIMIT: "4"
+  KUBERNETES_CPU_REQUEST: "2"
+  KUBERNETES_MEMORY_LIMIT: "6Gi"
+  KUBERNETES_MEMORY_REQUEST: "3Gi"
+  ARCH_LIST: "linux/amd64,linux/arm64"
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG
+
+include:
+  - project: dgx/infra/ngc-publishing-automation
+    ref: main
+    file: ngc-publishing-automation.yml
+    rules:
+      - if: $CI_COMMIT_TAG
+    inputs:
+      git_user: ${GITLAB_USER}
+      git_email: ${GITLAB_USER}@exchange.nvidia.com
+      team: skyhook
+      artifact_map: artifacts.json
+      email: ${NOTIFY_EMAIL}
+      action: UPDATE_VERSION
+      public: True
+      needs:
+      - job: bootstrap
+        artifacts: true
+      - job: create-operator-json
+        optional: true
+        artifacts: true
+      - job: create-agent-json
+        optional: true
+        artifacts: true
+      - job: create-chart-json
+        optional: true
+        artifacts: true
+
+## setup vault creds
+bootstrap:
+  rules:
+    - when: always
+  variables: 
+    KUBERNETES_MEMORY_REQUEST: "512Mi"
+  id_tokens:
+    VAULT_JWT_TOKEN:
+      aud: ${VAULT_ADDR}
+  script:
+    - vault version
+    - export VAULT_TOKEN="$(vault write -field=token "auth/${VAULT_AUTH_MOUNT}/login" "role=${VAULT_AUTH_ROLE}" "jwt=${VAULT_JWT_TOKEN}")"
+    - echo "VAULT_TOKEN=${VAULT_TOKEN}" >> build.env
+    - export pypi_user="$(vault kv get -field=username "$ARTIFACTORY_TOKEN")"
+    - export pypi_password="$(vault kv get -field=password "$ARTIFACTORY_TOKEN")"
+    - echo "PIP_EXTRA_INDEX_URL=https://${pypi_user}:${pypi_password}@$ARTIFACTORY_URL" >> build.env
+    - echo "NVCR_REGISTRY_PASSWORD=$(vault read -field=password "${NVCR_TOKEN}")" >> build.env
+    - echo "GHCR_REGISTRY_PASSWORD=$(vault read -field=pat "${GHCR_TOKEN}")" >> build.env
+    - echo "GITLAB_USER=${GITLAB_USER}" >> build.env
+    - echo "GITLAB_EMAIL=${GITLAB_USER}@exchange.nvidia.com" >> build.env
+    - echo "GITLAB_TOKEN=$(vault kv get -field=password ${GITLAB_TOKEN_LOCATION})" >> build.env
+  artifacts:
+    access: none
+    reports:
+      dotenv: build.env
+
+mirror-operator-image:
+  stage: deploy
+  rules: 
+    - if: '$CI_COMMIT_TAG =~ /^operator\/v\d+\.\d+\.\d+$/'
+      needs: [bootstrap]
+  image:
+    name: docker:24.0.5
+  services:
+    - name: docker:24.0.5-dind
+      variables:
+        HEALTHCHECK_TCP_PORT: "2376"
+  variables:
+    GHCR_REGISTRY: ghcr.io
+    GHCR_REGISTRY_IMAGE: "${GHCR_REGISTRY}/nvidia/nodewright/operator"
+    NVCR_REGISTRY_IMAGE: "${NVCR_REGISTRY}/skyhook/operator"
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_TLS_VERIFY: 1
+    DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
+  before_script:
+    - echo "{\"auths\":{\"nvcr.io\":{\"auth\":\"$(printf "%s:%s" "${NVCR_REGISTRY_USER}" "${NVCR_REGISTRY_PASSWORD}" | base64 | tr -d '\n')\"},\"${GHCR_REGISTRY}\":{\"auth\":\"$(printf "%s:%s" "${GHCR_REGISTRY_USER}" "${GHCR_REGISTRY_PASSWORD}" | base64 | tr -d '\n')\"}}}" > config.json
+  script:
+    - until docker info >/dev/null 2>&1; do sleep 1; done
+    - export IMG_TAG="${CI_COMMIT_TAG#operator/}"
+    - |
+      export IMAGE_TARGETS=""
+      for ARCH in ${ARCH_LIST//,/ }; do 
+        ARCH_SUFFIX="${ARCH#linux/}"
+        docker --config . pull "${GHCR_REGISTRY_IMAGE}:${IMG_TAG}" --platform "${ARCH}"
+        docker --config . tag "${GHCR_REGISTRY_IMAGE}:${IMG_TAG}" "${NVCR_REGISTRY_IMAGE}:${IMG_TAG}-${ARCH_SUFFIX}"
+        docker --config . push "${NVCR_REGISTRY_IMAGE}:${IMG_TAG}-${ARCH_SUFFIX}"
+        IMAGE_TARGETS="${IMAGE_TARGETS}--amend ${NVCR_REGISTRY_IMAGE}:${IMG_TAG}-${ARCH_SUFFIX} "
+      done
+    - docker --config . manifest create "${NVCR_REGISTRY_IMAGE}:${IMG_TAG}" ${IMAGE_TARGETS}
+    - docker --config . manifest push "${NVCR_REGISTRY_IMAGE}:${IMG_TAG}"
+    
+mirror-agent-image:
+  stage: deploy
+  rules: 
+    - if: '$CI_COMMIT_TAG =~ /^agent\/v\d+\.\d+\.\d+$/'
+      needs: [bootstrap]
+  image:
+    name: docker:24.0.5
+  services:
+    - name: docker:24.0.5-dind
+      variables:
+        HEALTHCHECK_TCP_PORT: "2376"
+  variables:
+    GHCR_REGISTRY: ghcr.io
+    GHCR_REGISTRY_IMAGE: "${GHCR_REGISTRY}/nvidia/nodewright/agent"
+    NVCR_REGISTRY_IMAGE: "${NVCR_REGISTRY}/skyhook/agent"
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_TLS_VERIFY: 1
+    DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
+  before_script:
+    - echo "{\"auths\":{\"nvcr.io\":{\"auth\":\"$(printf "%s:%s" "${NVCR_REGISTRY_USER}" "${NVCR_REGISTRY_PASSWORD}" | base64 | tr -d '\n')\"},\"${GHCR_REGISTRY}\":{\"auth\":\"$(printf "%s:%s" "${GHCR_REGISTRY_USER}" "${GHCR_REGISTRY_PASSWORD}" | base64 | tr -d '\n')\"}}}" > config.json
+  script:
+    - until docker info >/dev/null 2>&1; do sleep 1; done
+    - export IMG_TAG="${CI_COMMIT_TAG#agent/}"
+    - |
+      export IMAGE_TARGETS=""
+      for ARCH in ${ARCH_LIST//,/ }; do 
+        ARCH_SUFFIX="${ARCH#linux/}"
+        docker --config . pull "${GHCR_REGISTRY_IMAGE}:${IMG_TAG}" --platform "${ARCH}"
+        docker --config . tag "${GHCR_REGISTRY_IMAGE}:${IMG_TAG}" "${NVCR_REGISTRY_IMAGE}:${IMG_TAG}-${ARCH_SUFFIX}"
+        docker --config . push "${NVCR_REGISTRY_IMAGE}:${IMG_TAG}-${ARCH_SUFFIX}"
+        IMAGE_TARGETS="${IMAGE_TARGETS}--amend ${NVCR_REGISTRY_IMAGE}:${IMG_TAG}-${ARCH_SUFFIX} "
+      done
+    - docker --config . manifest create "${NVCR_REGISTRY_IMAGE}:${IMG_TAG}" ${IMAGE_TARGETS}
+    - docker --config . manifest push "${NVCR_REGISTRY_IMAGE}:${IMG_TAG}"
+
+create-operator-json:
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^operator\/v\d+\.\d+\.\d+$/'
+  needs: 
+    - job: bootstrap
+      artifacts: true
+  script:
+    - |
+      cat > artifacts.json << EOF
+      {
+        "skyhook": {
+          "source": {
+            "org": "${NGC_PRIVATE_ORG}",
+            "team": "skyhook"
+          },
+          "target": {
+            "org": "nvidia",
+            "team": "skyhook"
+          },
+          "artifacts": [
+            {
+              "name": "operator",
+              "version": "${CI_COMMIT_TAG#operator/}",
+              "type": "container"
+            }
+          ],
+          "nspect_id": "${OPERATOR_NSPECT_ID}",
+          "release_version": "${CI_COMMIT_TAG#operator/}"
+        }
+      }
+      EOF
+  artifacts:
+    paths:
+      - artifacts.json
+
+create-agent-json:
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^agent\/v\d+\.\d+\.\d+$/'
+  needs: 
+    - job: bootstrap
+      artifacts: true
+  script:
+    - |
+      cat > artifacts.json << EOF
+      {
+        "skyhook": {
+          "source": {
+            "org": "${NGC_PRIVATE_ORG}",
+            "team": "skyhook"
+          },
+          "target": {
+            "org": "nvidia",
+            "team": "skyhook"
+          },
+          "artifacts": [
+            {
+              "name": "agent",
+              "version": "${CI_COMMIT_TAG#agent/}",
+              "type": "container"
+            }
+          ],
+          "nspect_id": "${AGENT_NSPECT_ID}",
+          "release_version": "${CI_COMMIT_TAG#agent/}"
+        }
+      }
+      EOF
+  artifacts:
+    paths:
+      - artifacts.json
+
+create-chart-json:
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^chart\/v\d+\.\d+\.\d+$/'
+  needs: 
+    - job: bootstrap
+      artifacts: true
+  script:
+    - |
+      cat > artifacts.json << EOF
+      {
+        "skyhook": {
+          "source": {
+            "org": "${NGC_PRIVATE_ORG}",
+            "team": "skyhook"
+          },
+          "target": {
+            "org": "nvidia",
+            "team": "skyhook"
+          },
+          "artifacts": [
+            {
+              "name": "skyhook-operator",
+              "version": "${CI_COMMIT_TAG#chart/}",
+              "type": "chart"
+            }
+          ],
+          "nspect_id": "${OPERATOR_NSPECT_ID}",
+          "release_version": "${CI_COMMIT_TAG#chart/}"
+        }
+      }
+      EOF
+  artifacts:
+    paths:
+      - artifacts.json
+
+publish-chart:
+  stage: deploy
+  rules:
+    ## on commit to main publish a chart to our dev registry
+    - if: $CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH
+      needs: [bootstrap]
+      variables:
+        ENV: dev
+        VERSION: $CI_COMMIT_SHORT_SHA
+        OCI_PATH: nvidian/swgpu-baseos
+    ## on tag publish a chart to the prod staging registry
+    - if: '$CI_COMMIT_TAG =~ /^chart\/v\d+\.\d+\.\d+$/'
+      needs: [bootstrap]
+      variables:
+        ENV: prod
+        OCI_PATH: nvstaging/skyhook
+  variables:
+    USERNAME: "$$oauthtoken"
+    PASSWORD: ${NVCR_REGISTRY_PASSWORD}
+    ARGS: ""
+  script:
+    - if [ "${ENV}" == "dev" ]; then ARGS="--version $(date +%Y.%m.%d)-${CI_COMMIT_SHORT_SHA}"; fi
+    - echo "${PASSWORD}" | /workspace/bin/helm registry login nvcr.io --username "${USERNAME}" --password-stdin
+    - /workspace/bin/helm package chart ${ARGS}
+    - /workspace/bin/helm push $(ls skyhook-operator-*.tgz) oci://nvcr.io/${OCI_PATH}

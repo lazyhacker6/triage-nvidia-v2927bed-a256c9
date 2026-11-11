@@ -1,0 +1,1626 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package controller
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"strings"
+	"time"
+
+	"github.com/NVIDIA/nodewright/operator/api/nodewright/v1alpha1"
+	"github.com/NVIDIA/nodewright/operator/internal/wrapper"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+)
+
+var _ = Describe("Jobs execution swap", func() {
+	const (
+		skyhookName = "gpu-init"
+		nodeName    = "worker-1"
+		namespace   = "skyhook"
+		image       = "ghcr.io/nvidia/skyhook-packages/tuning:1.0.0"
+	)
+	pkg := &v1alpha1.Package{PackageRef: v1alpha1.PackageRef{Name: "tuning", Version: "1.0.0"}, Image: image}
+
+	nameLabel := fmt.Sprintf("%s/name", v1alpha1.METADATA_PREFIX)
+	packageLabel := fmt.Sprintf("%s/package", v1alpha1.METADATA_PREFIX)
+	nodeLabel := fmt.Sprintf("%s/node", v1alpha1.METADATA_PREFIX)
+	stageLabel := fmt.Sprintf("%s/stage", v1alpha1.METADATA_PREFIX)
+
+	validOpts := func() SkyhookOperatorOptions {
+		return SkyhookOperatorOptions{
+			Namespace:            namespace,
+			CopyDirRoot:          "/var/lib/skyhook",
+			AgentLogRoot:         "/var/log/skyhook",
+			RuntimeRequiredTaint: "skyhook.nvidia.com=runtime-required:NoSchedule",
+			AgentImage:           "ghcr.io/nvidia/skyhook/agent:1.2.3",
+			PauseImage:           "registry.k8s.io/pause:3.10",
+			MaxInterval:          10 * time.Minute,
+			JobOperatorOptions: JobOperatorOptions{
+				JobTTLSucceeded: time.Hour,
+				JobTTLFailed:    24 * time.Hour,
+				JobStageTimeout: time.Hour,
+				JobBackoffLimit: 3,
+			},
+		}
+	}
+
+	newReconciler := func(objects ...client.Object) (*SkyhookReconciler, client.WithWatch) {
+		scheme := runtime.NewScheme()
+		Expect(corev1.AddToScheme(scheme)).To(Succeed())
+		Expect(batchv1.AddToScheme(scheme)).To(Succeed())
+		Expect(v1alpha1.AddToScheme(scheme)).To(Succeed())
+
+		c := newFakeClientBuilder().WithScheme(scheme).WithObjects(objects...).WithStatusSubresource(&v1alpha1.NodeWright{}).
+			WithIndex(&corev1.Pod{}, fieldSelectorNodeName, func(obj client.Object) []string {
+				pod, ok := obj.(*corev1.Pod)
+				if !ok {
+					return nil
+				}
+				return []string{pod.Spec.NodeName}
+			}).Build()
+		r, err := NewSkyhookReconciler(scheme, c, c, events.NewFakeRecorder(50), validOpts())
+		Expect(err).ToNot(HaveOccurred())
+		return r, c
+	}
+	newPodWatch := func(objects ...client.Object) (*PodReconciler, client.WithWatch) {
+		_, c := newReconciler(objects...)
+		return NewPodReconciler(c, c, events.NewFakeRecorder(50), namespace), c
+	}
+
+	stageJob := func(stage v1alpha1.Stage, conditions ...batchv1.JobCondition) *batchv1.Job {
+		return &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "tuning-1-0-0-" + string(stage), Namespace: namespace, UID: "job-uid",
+				Labels: map[string]string{
+					nameLabel:    skyhookName,
+					packageLabel: "tuning-1.0.0",
+					nodeLabel:    nodeName,
+				},
+			},
+			Spec:   batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{NodeName: nodeName}}},
+			Status: batchv1.JobStatus{Conditions: conditions},
+		}
+	}
+
+	jobOwnedPod := func(name string, statuses ...corev1.ContainerStatus) *corev1.Pod {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: name, Namespace: namespace,
+				Labels: map[string]string{
+					nameLabel:         skyhookName,
+					packageLabel:      "tuning-1.0.0",
+					batchJobNameLabel: "tuning-1-0-0-apply",
+				},
+			},
+			// An apply-stage pod: job_builder.go runs package stages under restartPolicy Never.
+			Spec:   corev1.PodSpec{NodeName: nodeName, RestartPolicy: corev1.RestartPolicyNever},
+			Status: corev1.PodStatus{InitContainerStatuses: statuses},
+		}
+		// Child pods inherit the package annotation from the Job pod template; the in-flight
+		// erroring path reads it off the pod, so the fixture must carry it.
+		Expect(SetPackages(pod, &v1alpha1.NodeWright{ObjectMeta: metav1.ObjectMeta{Name: skyhookName}}, image, v1alpha1.StageApply, pkg)).To(Succeed())
+		return pod
+	}
+
+	It("creates a package Job (not a raw pod) for a fresh stage", func() {
+		node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}
+		scr := &v1alpha1.NodeWright{
+			ObjectMeta: metav1.ObjectMeta{Name: skyhookName, Namespace: namespace, Generation: 1},
+			Spec:       v1alpha1.NodeWrightSpec{Packages: v1alpha1.Packages{"tuning": *pkg}},
+		}
+		r, c := newReconciler(node, scr)
+		skyhookNode, err := wrapper.NewSkyhookNode(node, scr)
+		Expect(err).ToNot(HaveOccurred())
+
+		Expect(r.ApplyPackage(ctx, GinkgoLogr, nil, skyhookNode, pkg, false)).To(Succeed())
+
+		var jobs batchv1.JobList
+		Expect(c.List(ctx, &jobs, client.InNamespace(namespace))).To(Succeed())
+		Expect(jobs.Items).To(HaveLen(1))
+		Expect(jobs.Items[0].Labels).To(HaveKeyWithValue(nameLabel, skyhookName))
+		Expect(jobs.Items[0].Labels).To(HaveKeyWithValue(stageLabel, string(v1alpha1.StageApply)))
+
+		// no raw package pod is created by the swap
+		var pods corev1.PodList
+		Expect(c.List(ctx, &pods, client.InNamespace(namespace))).To(Succeed())
+		Expect(pods.Items).To(BeEmpty())
+	})
+
+	It("stamps a config Job with a hash of the ConfigMap data it will mount", func() {
+		data := map[string]string{"a.properties": "new"}
+		cmPkg := pkg.DeepCopy()
+		cmPkg.ConfigMap = data
+		node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}
+		seeded, err := wrapper.NewSkyhookNodeOnly(node, skyhookName)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(seeded.Upsert(cmPkg.PackageRef, image, v1alpha1.StateInProgress, v1alpha1.StageConfig, 0, "")).To(Succeed())
+		scr := &v1alpha1.NodeWright{
+			ObjectMeta: metav1.ObjectMeta{Name: skyhookName, Namespace: namespace, Generation: 1},
+			Spec:       v1alpha1.NodeWrightSpec{Packages: v1alpha1.Packages{"tuning": *cmPkg}},
+		}
+		cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "gpu-init-tuning-1.0.0"}, Data: data}
+		r, c := newReconciler(node, scr, cm)
+		skyhookNode, err := wrapper.NewSkyhookNode(node, scr)
+		Expect(err).ToNot(HaveOccurred())
+
+		Expect(r.ApplyPackage(ctx, GinkgoLogr, nil, skyhookNode, cmPkg, false)).To(Succeed())
+
+		var jobs batchv1.JobList
+		Expect(c.List(ctx, &jobs, client.InNamespace(namespace))).To(Succeed())
+		Expect(jobs.Items).To(HaveLen(1))
+		Expect(jobs.Items[0].Labels).To(HaveKeyWithValue(stageLabel, string(v1alpha1.StageConfig)))
+		Expect(jobs.Items[0].Annotations).To(HaveKeyWithValue(annotationConfigHash, configDataHash(data)))
+	})
+
+	It("stamps the hash from the apiserver's ConfigMap, not a cache that still holds the old one", func() {
+		oldData := map[string]string{"a.properties": "old"}
+		newData := map[string]string{"a.properties": "new"}
+		cmPkg := pkg.DeepCopy()
+		cmPkg.ConfigMap = newData
+		node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}
+		seeded, err := wrapper.NewSkyhookNodeOnly(node, skyhookName)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(seeded.Upsert(cmPkg.PackageRef, image, v1alpha1.StateInProgress, v1alpha1.StageConfig, 0, "")).To(Succeed())
+		scr := &v1alpha1.NodeWright{
+			ObjectMeta: metav1.ObjectMeta{Name: skyhookName, Namespace: namespace, Generation: 1},
+			Spec:       v1alpha1.NodeWrightSpec{Packages: v1alpha1.Packages{"tuning": *cmPkg}},
+		}
+		cmName := packageConfigMapName(skyhookName, cmPkg.Name, cmPkg.Version)
+		r, c := newReconciler(node, scr, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: cmName}, Data: oldData})
+
+		scheme := runtime.NewScheme()
+		Expect(corev1.AddToScheme(scheme)).To(Succeed())
+		r.uncached = newFakeClientBuilder().WithScheme(scheme).
+			WithObjects(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: cmName}, Data: newData}).Build()
+
+		skyhookNode, err := wrapper.NewSkyhookNode(node, scr)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(r.ApplyPackage(ctx, GinkgoLogr, nil, skyhookNode, cmPkg, false)).To(Succeed())
+
+		var jobs batchv1.JobList
+		Expect(c.List(ctx, &jobs, client.InNamespace(namespace))).To(Succeed())
+		Expect(jobs.Items).To(HaveLen(1))
+		Expect(jobs.Items[0].Annotations).To(HaveKeyWithValue(annotationConfigHash, configDataHash(newData)))
+	})
+
+	It("starts one package per node per pass under serial", func() {
+		nodes := []corev1.Node{{ObjectMeta: metav1.ObjectMeta{Name: "worker-a"}}, {ObjectMeta: metav1.ObjectMeta{Name: "worker-b"}}}
+		other := v1alpha1.Package{PackageRef: v1alpha1.PackageRef{Name: "other", Version: "1.0.0"}, Image: image}
+		scr := &v1alpha1.NodeWright{
+			ObjectMeta: metav1.ObjectMeta{Name: skyhookName, Generation: 1},
+			Spec:       v1alpha1.NodeWrightSpec{Serial: true, Packages: v1alpha1.Packages{"tuning": *pkg, "other": other}},
+		}
+		r, c := newReconciler(&nodes[0], &nodes[1], scr)
+		state, err := BuildState(&v1alpha1.NodeWrightList{Items: []v1alpha1.NodeWright{*scr}}, &corev1.NodeList{Items: nodes}, &v1alpha1.DeploymentPolicyList{})
+		Expect(err).ToNot(HaveOccurred())
+
+		res, err := r.RunSkyhookPackages(ctx, state, NewNodePicker(GinkgoLogr, nil), state.skyhooks[0])
+		Expect(err).ToNot(HaveOccurred())
+		Expect(res).To(HaveField("RequeueAfter", 2*time.Second), "serial requeues to pick up each node's next package")
+
+		var jobs batchv1.JobList
+		Expect(c.List(ctx, &jobs, client.InNamespace(namespace))).To(Succeed())
+		perNode := map[string]int{}
+		for _, job := range jobs.Items {
+			perNode[job.Labels[nodeLabel]]++
+		}
+		Expect(perNode).To(Equal(map[string]int{"worker-a": 1, "worker-b": 1}))
+	})
+
+	It("starts nothing else on a serial node while an interrupt package waits on its drain", func() {
+		node := corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}
+		drainer := v1alpha1.Package{PackageRef: v1alpha1.PackageRef{Name: "drainer", Version: "1.0.0"}, Image: image,
+			Interrupt: &v1alpha1.Interrupt{Type: v1alpha1.SERVICE, Services: []string{"containerd"}}}
+		other := v1alpha1.Package{PackageRef: v1alpha1.PackageRef{Name: "other", Version: "1.0.0"}, Image: image}
+		scr := &v1alpha1.NodeWright{
+			ObjectMeta: metav1.ObjectMeta{Name: skyhookName, Generation: 1},
+			Spec:       v1alpha1.NodeWrightSpec{Serial: true, Packages: v1alpha1.Packages{"drainer": drainer, "other": other}},
+		}
+		r, c := newReconciler(&node, scr)
+		state, err := BuildState(&v1alpha1.NodeWrightList{Items: []v1alpha1.NodeWright{*scr}}, &corev1.NodeList{Items: []corev1.Node{node}}, &v1alpha1.DeploymentPolicyList{})
+		Expect(err).ToNot(HaveOccurred())
+
+		_, err = r.RunSkyhookPackages(ctx, state, NewNodePicker(GinkgoLogr, nil), state.skyhooks[0])
+		Expect(err).ToNot(HaveOccurred())
+
+		// drainer is ordered first and only cordons this pass; other must wait for it
+		var jobs batchv1.JobList
+		Expect(c.List(ctx, &jobs, client.InNamespace(namespace))).To(Succeed())
+		Expect(jobs.Items).To(BeEmpty())
+		var got corev1.Node
+		Expect(c.Get(ctx, types.NamespacedName{Name: nodeName}, &got)).To(Succeed())
+		Expect(got.Spec.Unschedulable).To(BeTrue())
+	})
+
+	It("moves past a skipped interrupt on a serial node to the package whose interrupt won", func() {
+		node := corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}
+		service := v1alpha1.Package{PackageRef: v1alpha1.PackageRef{Name: "a-service", Version: "1.0.0"}, Image: image,
+			Interrupt: &v1alpha1.Interrupt{Type: v1alpha1.SERVICE, Services: []string{"containerd"}}}
+		reboot := v1alpha1.Package{PackageRef: v1alpha1.PackageRef{Name: "b-reboot", Version: "1.0.0"}, Image: image,
+			Interrupt: &v1alpha1.Interrupt{Type: v1alpha1.REBOOT}}
+		seeded, err := wrapper.NewSkyhookNodeOnly(&node, skyhookName)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(seeded.Upsert(service.PackageRef, image, v1alpha1.StateComplete, v1alpha1.StageConfig, 0, "")).To(Succeed())
+		scr := &v1alpha1.NodeWright{
+			ObjectMeta: metav1.ObjectMeta{Name: skyhookName, Generation: 1},
+			Spec:       v1alpha1.NodeWrightSpec{Serial: true, Packages: v1alpha1.Packages{"a-service": service, "b-reboot": reboot}},
+		}
+		r, c := newReconciler(&node, scr)
+		state, err := BuildState(&v1alpha1.NodeWrightList{Items: []v1alpha1.NodeWright{*scr}}, &corev1.NodeList{Items: []corev1.Node{node}}, &v1alpha1.DeploymentPolicyList{})
+		Expect(err).ToNot(HaveOccurred())
+
+		_, err = r.RunSkyhookPackages(ctx, state, NewNodePicker(GinkgoLogr, nil), state.skyhooks[0])
+		Expect(err).ToNot(HaveOccurred())
+
+		// a-service yields to the reboot; holding the node on it would leave b-reboot never started
+		var got corev1.Node
+		Expect(c.Get(ctx, types.NamespacedName{Name: nodeName}, &got)).To(Succeed())
+		gsn, err := wrapper.NewSkyhookNodeOnly(&got, skyhookName)
+		Expect(err).ToNot(HaveOccurred())
+		status, found := gsn.PackageStatus(service.GetUniqueName())
+		Expect(found).To(BeTrue())
+		Expect(status.IsSkipped()).To(BeTrue())
+		Expect(got.Spec.Unschedulable).To(BeTrue(), "b-reboot was reached and cordoned for its apply")
+	})
+
+	It("keeps a sequencing-held node waiting on the runtime-required taint the pods tolerate", func() {
+		// If RunSkyhookPackages introspected without the runtime-required tolerations, the taint
+		// would read as untolerated and the node would report blocked instead of waiting.
+		node := corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: nodeName},
+			Spec:       corev1.NodeSpec{Taints: []corev1.Taint{{Key: "skyhook.nvidia.com", Value: "runtime-required", Effect: corev1.TaintEffectNoSchedule}}},
+		}
+		first := v1alpha1.NodeWright{
+			ObjectMeta: metav1.ObjectMeta{Name: "first", Generation: 1},
+			Spec:       v1alpha1.NodeWrightSpec{Priority: 1, Packages: v1alpha1.Packages{"tuning": *pkg}},
+		}
+		second := v1alpha1.NodeWright{
+			ObjectMeta: metav1.ObjectMeta{Name: skyhookName, Generation: 1},
+			Spec:       v1alpha1.NodeWrightSpec{Priority: 2, Packages: v1alpha1.Packages{"tuning": *pkg}},
+		}
+		r, _ := newReconciler(&node, &first, &second)
+		state, err := BuildState(&v1alpha1.NodeWrightList{Items: []v1alpha1.NodeWright{first, second}}, &corev1.NodeList{Items: []corev1.Node{node}}, &v1alpha1.DeploymentPolicyList{})
+		Expect(err).ToNot(HaveOccurred())
+		var held SkyhookNodes
+		for _, s := range state.skyhooks {
+			if s.GetSkyhook().Name == skyhookName {
+				held = s
+			}
+		}
+
+		_, err = r.RunSkyhookPackages(ctx, state, NewNodePicker(GinkgoLogr, r.opts.GetRuntimeRequiredTolerations()), held)
+		Expect(err).ToNot(HaveOccurred())
+
+		_, wrapped := held.GetNode(nodeName)
+		Expect(wrapped.Status()).To(Equal(v1alpha1.StatusWaiting))
+	})
+
+	Describe("a merged interrupt", func() {
+		// Named so a pass reaches kernel, which owns the merged reboot, first.
+		kernel := v1alpha1.Package{PackageRef: v1alpha1.PackageRef{Name: "a-kernel", Version: "1.0.0"}, Image: image,
+			Interrupt: &v1alpha1.Interrupt{Type: v1alpha1.REBOOT}}
+		tuned := v1alpha1.Package{PackageRef: v1alpha1.PackageRef{Name: "b-tuned", Version: "1.0.0"}, Image: image,
+			Interrupt: &v1alpha1.Interrupt{Type: v1alpha1.REBOOT}}
+
+		// runPass makes one pass over a node where kernel has finished its config and tuned is at
+		// (tunedStage, tunedState), or has not started when tunedStage is empty. It returns the
+		// stages of the Jobs the pass created and the node it persisted.
+		runPass := func(serial bool, tunedStage v1alpha1.Stage, tunedState v1alpha1.State) ([]string, *corev1.Node) {
+			GinkgoHelper()
+			node := corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}
+			seeded, err := wrapper.NewSkyhookNodeOnly(&node, skyhookName)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(seeded.Upsert(kernel.PackageRef, image, v1alpha1.StateComplete, v1alpha1.StageConfig, 0, "")).To(Succeed())
+			if tunedStage != "" {
+				Expect(seeded.Upsert(tuned.PackageRef, image, tunedState, tunedStage, 0, "")).To(Succeed())
+			}
+			scr := &v1alpha1.NodeWright{
+				ObjectMeta: metav1.ObjectMeta{Name: skyhookName, Generation: 1},
+				Spec:       v1alpha1.NodeWrightSpec{Serial: serial, Packages: v1alpha1.Packages{kernel.Name: kernel, tuned.Name: tuned}},
+			}
+			r, c := newReconciler(&node, scr)
+			state, err := BuildState(&v1alpha1.NodeWrightList{Items: []v1alpha1.NodeWright{*scr}}, &corev1.NodeList{Items: []corev1.Node{node}}, &v1alpha1.DeploymentPolicyList{})
+			Expect(err).ToNot(HaveOccurred())
+
+			_, err = r.RunSkyhookPackages(ctx, state, NewNodePicker(GinkgoLogr, nil), state.skyhooks[0])
+			Expect(err).ToNot(HaveOccurred())
+
+			var jobs batchv1.JobList
+			Expect(c.List(ctx, &jobs, client.InNamespace(namespace))).To(Succeed())
+			stages := make([]string, 0, len(jobs.Items))
+			for _, job := range jobs.Items {
+				stages = append(stages, job.Labels[stageLabel])
+			}
+			var got corev1.Node
+			Expect(c.Get(ctx, types.NamespacedName{Name: nodeName}, &got)).To(Succeed())
+			return stages, &got
+		}
+
+		expectStatus := func(node *corev1.Node, pkg v1alpha1.Package, stage v1alpha1.Stage, state v1alpha1.State) {
+			GinkgoHelper()
+			persisted, err := wrapper.NewSkyhookNodeOnly(node, skyhookName)
+			Expect(err).ToNot(HaveOccurred())
+			status, found := persisted.PackageStatus(pkg.GetUniqueName())
+			Expect(found).To(BeTrue())
+			Expect(status.Stage).To(Equal(stage))
+			Expect(status.State).To(Equal(state))
+		}
+
+		DescribeTable("waits for a package between its apply and config rather than rebooting under it",
+			func(serial bool) {
+				stages, node := runPass(serial, v1alpha1.StageApply, v1alpha1.StateComplete)
+
+				// nothing is running between tuned's apply and config, so only the barrier holds the reboot
+				Expect(stages).To(ConsistOf(string(v1alpha1.StageConfig)))
+				expectStatus(node, kernel, v1alpha1.StageConfig, v1alpha1.StateComplete)
+			},
+			Entry("in parallel", false),
+			Entry("on a serial node, which moves past the held reboot", true),
+		)
+
+		It("starts a package that has not begun on a serial node rather than stopping at the held reboot", func() {
+			stages, node := runPass(true, "", "")
+
+			// tuned is reached and cordons the node for its apply; stopping at kernel would leave it never started
+			Expect(stages).To(BeEmpty())
+			Expect(node.Spec.Unschedulable).To(BeTrue())
+			expectStatus(node, kernel, v1alpha1.StageConfig, v1alpha1.StateComplete)
+		})
+
+		DescribeTable("marks a package that has finished its config skipped before rebooting",
+			func(serial bool) {
+				stages, node := runPass(serial, v1alpha1.StageConfig, v1alpha1.StateComplete)
+
+				// on a serial node the pass stops at kernel once it reboots, so tuned must be skipped first
+				Expect(stages).To(BeEmpty())
+				expectStatus(node, tuned, v1alpha1.StageInterrupt, v1alpha1.StateSkipped)
+				expectStatus(node, kernel, v1alpha1.StageConfig, v1alpha1.StateComplete)
+			},
+			Entry("in parallel", false),
+			Entry("on a serial node", true),
+		)
+
+		DescribeTable("reboots once for both after the other is skipped at its interrupt",
+			func(serial bool) {
+				stages, node := runPass(serial, v1alpha1.StageInterrupt, v1alpha1.StateSkipped)
+
+				Expect(stages).To(ConsistOf(string(v1alpha1.StageInterrupt)))
+				expectStatus(node, tuned, v1alpha1.StageInterrupt, v1alpha1.StateSkipped)
+			},
+			Entry("in parallel", false),
+			Entry("on a serial node", true),
+		)
+	})
+
+	Describe("JobExists", func() {
+		It("counts an unfinished Job", func() {
+			r, _ := newReconciler(stageJob(v1alpha1.StageApply))
+			exists, err := r.JobExists(ctx, nodeName, skyhookName, pkg)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(exists).To(BeTrue())
+		})
+
+		It("does not count a finished Job (so the stage can re-run once it is cleaned)", func() {
+			r, _ := newReconciler(stageJob(v1alpha1.StageApply, batchv1.JobCondition{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}))
+			exists, err := r.JobExists(ctx, nodeName, skyhookName, pkg)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(exists).To(BeFalse())
+		})
+	})
+
+	Describe("pod watch", func() {
+		It("does not delete a Job-owned pod on success (JobReconcile owns completion)", func() {
+			pod := jobOwnedPod("tuning-pod-ok", corev1.ContainerStatus{
+				Name: "apply", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}},
+			})
+			r, c := newPodWatch(pod)
+			_, err := r.PodReconcile(ctx, pod)
+			Expect(err).ToNot(HaveOccurred())
+			// still present: completion and cleanup belong to JobReconcile, never this watch
+			Expect(c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: pod.Name}, &corev1.Pod{})).To(Succeed())
+		})
+
+		It("stays silent for a Job-owned pod killed by a disruption", func() {
+			pod := jobOwnedPod("tuning-pod-evicted", corev1.ContainerStatus{
+				Name: "apply", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 137}},
+			})
+			pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.DisruptionTarget, Status: corev1.ConditionTrue}}
+			r, c := newPodWatch(pod)
+			_, err := r.PodReconcile(ctx, pod)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: pod.Name}, &corev1.Pod{})).To(Succeed())
+		})
+
+		It("records erroring from a Job-owned pod's genuine step failure", func() {
+			node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}
+			sn, err := wrapper.NewSkyhookNodeOnly(node, skyhookName)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(sn.Upsert(pkg.PackageRef, image, v1alpha1.StateInProgress, v1alpha1.StageApply, 0, "")).To(Succeed())
+
+			pod := jobOwnedPod("tuning-pod-failed", corev1.ContainerStatus{
+				Name: "apply", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1}},
+			})
+			r, c := newPodWatch(node, pod)
+			_, err = r.PodReconcile(ctx, pod)
+			Expect(err).ToNot(HaveOccurred())
+
+			// the pod carries the package annotation (from the template), so node state records erroring
+			var got corev1.Node
+			Expect(c.Get(ctx, types.NamespacedName{Name: nodeName}, &got)).To(Succeed())
+			gsn, err := wrapper.NewSkyhookNodeOnly(&got, skyhookName)
+			Expect(err).ToNot(HaveOccurred())
+			state, err := gsn.State()
+			Expect(err).ToNot(HaveOccurred())
+			Expect(state[pkg.GetUniqueName()].State).To(Equal(v1alpha1.StateErroring))
+		})
+
+		// The hung-stage case the per-attempt deadline exists for. The stuck container never
+		// started, so it has no exit code, and podFailureIsGenuine rejects every shape it can
+		// take (Waiting, or the kubelet's ContainerStatusUnknown rewrite on termination). The
+		// pod-level reason is the only evidence there is; without it a hang would read
+		// in_progress until the whole retry budget burned down.
+		It("records erroring from a per-attempt deadline whose container never started", func() {
+			node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}
+			sn, err := wrapper.NewSkyhookNodeOnly(node, skyhookName)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(sn.Upsert(pkg.PackageRef, image, v1alpha1.StateInProgress, v1alpha1.StageApply, 0, "")).To(Succeed())
+
+			pod := jobOwnedPod("tuning-pod-timeout", corev1.ContainerStatus{
+				Name:  "apply",
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff"}},
+			})
+			Expect(podFailureIsGenuine(pod)).To(BeFalse(), "precondition: no container verdict to read")
+			pod.Status.Phase = corev1.PodFailed
+			pod.Status.Reason = podReasonDeadlineExceeded
+
+			r, c := newPodWatch(node, pod)
+			_, err = r.PodReconcile(ctx, pod)
+			Expect(err).ToNot(HaveOccurred())
+
+			var got corev1.Node
+			Expect(c.Get(ctx, types.NamespacedName{Name: nodeName}, &got)).To(Succeed())
+			gsn, err := wrapper.NewSkyhookNodeOnly(&got, skyhookName)
+			Expect(err).ToNot(HaveOccurred())
+			state, err := gsn.State()
+			Expect(err).ToNot(HaveOccurred())
+			Expect(state[pkg.GetUniqueName()].State).To(Equal(v1alpha1.StateErroring))
+		})
+
+		Describe("an image that cannot be pulled", func() {
+			stuckPod := func(age time.Duration) *corev1.Pod {
+				pod := jobOwnedPod("tuning-pod-pull", corev1.ContainerStatus{
+					Name: "apply",
+					State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+						Reason: "ImagePullBackOff", Message: "Back-off pulling image \"nope:1\"",
+					}},
+				})
+				pod.Status.Phase = corev1.PodPending
+				pod.CreationTimestamp = metav1.NewTime(time.Now().Add(-age))
+				return pod
+			}
+
+			// The kubelet keeps retrying a failed pull, and a package's erroring entry is read elsewhere
+			// as evidence that its stage genuinely failed (the Job failure classification, the config
+			// update gate, UninstallFailed). The watch must leave it alone however long the pull fails.
+			It("is not recorded as a package failure, however long the pull has failed", func() {
+				node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}
+				sn, err := wrapper.NewSkyhookNodeOnly(node, skyhookName)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(sn.Upsert(pkg.PackageRef, image, v1alpha1.StateInProgress, v1alpha1.StageApply, 0, "")).To(Succeed())
+
+				pod := stuckPod(24 * time.Hour)
+				r, c := newPodWatch(node, pod)
+				res, err := r.PodReconcile(ctx, pod)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(res.RequeueAfter).To(BeZero())
+
+				var got corev1.Node
+				Expect(c.Get(ctx, types.NamespacedName{Name: nodeName}, &got)).To(Succeed())
+				gsn, err := wrapper.NewSkyhookNodeOnly(&got, skyhookName)
+				Expect(err).ToNot(HaveOccurred())
+				state, err := gsn.State()
+				Expect(err).ToNot(HaveOccurred())
+				Expect(state[pkg.GetUniqueName()].State).To(Equal(v1alpha1.StateInProgress))
+			})
+
+			Describe("the ImagePullFailed condition", func() {
+				var (
+					r        *SkyhookReconciler
+					recorder *events.FakeRecorder
+					scr      *v1alpha1.NodeWright
+					state    *clusterState
+				)
+
+				setup := func(pods ...client.Object) {
+					node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}
+					scr = &v1alpha1.NodeWright{
+						ObjectMeta: metav1.ObjectMeta{Name: skyhookName, Generation: 1},
+						Spec:       v1alpha1.NodeWrightSpec{Packages: v1alpha1.Packages{"tuning": *pkg}},
+					}
+					r, _ = newReconciler(append([]client.Object{node, scr}, pods...)...)
+					recorder = events.NewFakeRecorder(10)
+					r.recorder = recorder
+
+					var err error
+					state, err = BuildState(&v1alpha1.NodeWrightList{Items: []v1alpha1.NodeWright{*scr}},
+						&corev1.NodeList{Items: []corev1.Node{*node}}, &v1alpha1.DeploymentPolicyList{})
+					Expect(err).ToNot(HaveOccurred())
+				}
+
+				condition := func() *metav1.Condition {
+					return meta.FindStatusCondition(state.skyhooks[0].GetSkyhook().Status.Conditions, wrapper.SkyhookConditionImagePullFailed)
+				}
+
+				It("is set, with a Warning event, once the pull has failed past the grace period", func() {
+					setup(stuckPod(imagePullGracePeriod + time.Minute))
+
+					Expect(r.updateImagePullFailedCondition(ctx, state.skyhooks[0])).To(Succeed())
+
+					Expect(condition()).ToNot(BeNil())
+					Expect(condition().Status).To(Equal(metav1.ConditionTrue))
+					Expect(condition().Message).To(And(ContainSubstring(nodeName), ContainSubstring("package [tuning-1.0.0]"), ContainSubstring("container [apply]")))
+					Expect(recorder.Events).To(Receive(And(ContainSubstring("Warning"), ContainSubstring("cannot pull a package image"), ContainSubstring("ImagePullBackOff"))))
+				})
+
+				It("is not set when the NodeWright has no pods", func() {
+					setup()
+
+					Expect(r.updateImagePullFailedCondition(ctx, state.skyhooks[0])).To(Succeed())
+
+					Expect(condition()).To(BeNil())
+				})
+
+				It("is not set within the grace period", func() {
+					setup(stuckPod(time.Minute))
+
+					Expect(r.updateImagePullFailedCondition(ctx, state.skyhooks[0])).To(Succeed())
+
+					Expect(condition()).To(BeNil())
+					Expect(recorder.Events).To(BeEmpty())
+				})
+
+				It("measures the grace period from the last init container that finished", func() {
+					pod := stuckPod(time.Hour)
+					pod.Status.InitContainerStatuses = append([]corev1.ContainerStatus{{
+						Name: "pull-me-first",
+						State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+							ExitCode: 0, FinishedAt: metav1.NewTime(time.Now().Add(-time.Second)),
+						}},
+					}}, pod.Status.InitContainerStatuses...)
+					setup(pod)
+
+					Expect(r.updateImagePullFailedCondition(ctx, state.skyhooks[0])).To(Succeed())
+
+					Expect(condition()).To(BeNil())
+				})
+
+				// Pods come back in no fixed order, a node usually has several failing at once, and the
+				// kubelet flips ErrImagePull and ImagePullBackOff on every retry. Any of those changing
+				// the message would be a status write, and a reconcile, on a pass where nothing changed.
+				It("keeps the same message however the pods are ordered and whatever the kubelet reports", func() {
+					second := stuckPod(time.Hour)
+					second.Name = "tuning-pod-pull-b"
+					second.Labels[packageAnnotationKey] = "aaa-1.0.0"
+					second.Status.InitContainerStatuses[0].State.Waiting.Reason = "ErrImagePull"
+					setup(stuckPod(time.Hour), second)
+
+					Expect(r.updateImagePullFailedCondition(ctx, state.skyhooks[0])).To(Succeed())
+					first := condition().Message
+					Expect(first).To(ContainSubstring("package [aaa-1.0.0]"), "the lowest package name stands for the node")
+					Expect(first).ToNot(ContainSubstring("ImagePullBackOff"))
+					Expect(first).ToNot(ContainSubstring("ErrImagePull"))
+
+					var flipped corev1.Pod
+					Expect(r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "tuning-pod-pull-b"}, &flipped)).To(Succeed())
+					flipped.Status.InitContainerStatuses[0].State.Waiting.Reason = "ImagePullBackOff"
+					Expect(r.Status().Update(ctx, &flipped)).To(Succeed())
+
+					Expect(r.updateImagePullFailedCondition(ctx, state.skyhooks[0])).To(Succeed())
+					Expect(condition().Message).To(Equal(first))
+				})
+
+				It("puts the kubelet's pull error in the event", func() {
+					setup(stuckPod(time.Hour))
+
+					Expect(r.updateImagePullFailedCondition(ctx, state.skyhooks[0])).To(Succeed())
+
+					Expect(recorder.Events).To(Receive(ContainSubstring("Back-off pulling image")))
+				})
+
+				// An interrupt pod restarts in place across a reboot and pulls again, so its pod
+				// creation time says nothing about how long this pull has been failing.
+				It("measures the grace period from the end of the container's previous run", func() {
+					pod := stuckPod(time.Hour)
+					pod.Status.InitContainerStatuses[0].LastTerminationState = corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, FinishedAt: metav1.NewTime(time.Now().Add(-10 * time.Second))},
+					}
+					setup(pod)
+
+					Expect(r.updateImagePullFailedCondition(ctx, state.skyhooks[0])).To(Succeed())
+
+					Expect(condition()).To(BeNil())
+				})
+
+				It("clears once the pull recovers, without a second event while it holds", func() {
+					setup(stuckPod(time.Hour))
+					Expect(r.updateImagePullFailedCondition(ctx, state.skyhooks[0])).To(Succeed())
+					Expect(condition()).ToNot(BeNil())
+					Expect(recorder.Events).To(Receive())
+
+					Expect(r.updateImagePullFailedCondition(ctx, state.skyhooks[0])).To(Succeed())
+					Expect(recorder.Events).To(BeEmpty(), "the event fires on the transition only")
+
+					var recovered corev1.Pod
+					Expect(r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "tuning-pod-pull"}, &recovered)).To(Succeed())
+					recovered.Status.Phase = corev1.PodRunning
+					recovered.Status.InitContainerStatuses[0].State = corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}
+					Expect(r.Status().Update(ctx, &recovered)).To(Succeed())
+
+					Expect(r.updateImagePullFailedCondition(ctx, state.skyhooks[0])).To(Succeed())
+					Expect(condition()).To(BeNil())
+				})
+
+				It("ignores a terminating pod", func() {
+					pod := stuckPod(time.Hour)
+					now := metav1.Now()
+					pod.DeletionTimestamp = &now
+					pod.Finalizers = []string{"test/hold"}
+					setup(pod)
+
+					Expect(r.updateImagePullFailedCondition(ctx, state.skyhooks[0])).To(Succeed())
+
+					Expect(condition()).To(BeNil())
+				})
+			})
+		})
+
+		// A failing Job under restartPolicy Never mints a fresh pod per attempt, so every one of
+		// these lands on the watch. If the watch could write an entry the reset just cleared, the
+		// package would be re-pinned to the cleared stage and the reset could never take effect.
+		DescribeTable("never creates or regresses a node-state entry",
+			func(seed func(wrapper.SkyhookNodeOnly)) {
+				node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}
+				sn, err := wrapper.NewSkyhookNodeOnly(node, skyhookName)
+				Expect(err).ToNot(HaveOccurred())
+				seed(sn)
+
+				pod := jobOwnedPod("tuning-pod-failed", corev1.ContainerStatus{
+					Name: "apply", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1}},
+				})
+				r, c := newPodWatch(node, pod)
+				_, err = r.PodReconcile(ctx, pod)
+				Expect(err).ToNot(HaveOccurred())
+
+				var got corev1.Node
+				Expect(c.Get(ctx, types.NamespacedName{Name: nodeName}, &got)).To(Succeed())
+				gsn, err := wrapper.NewSkyhookNodeOnly(&got, skyhookName)
+				Expect(err).ToNot(HaveOccurred())
+				after, err := gsn.State()
+				Expect(err).ToNot(HaveOccurred())
+
+				before, err := sn.State()
+				Expect(err).ToNot(HaveOccurred())
+				Expect(after).To(Equal(before))
+			},
+			Entry("entry cleared by a node reset", func(wrapper.SkyhookNodeOnly) {}),
+			Entry("entry already moved past the pod's stage", func(sn wrapper.SkyhookNodeOnly) {
+				Expect(sn.Upsert(pkg.PackageRef, image, v1alpha1.StateInProgress, v1alpha1.StageConfig, 0, "")).To(Succeed())
+			}),
+			Entry("entry already recorded complete for this stage", func(sn wrapper.SkyhookNodeOnly) {
+				Expect(sn.Upsert(pkg.PackageRef, image, v1alpha1.StateComplete, v1alpha1.StageApply, 0, "")).To(Succeed())
+			}),
+		)
+
+		// A package Job's retry is a fresh pod whose RestartCount is always 0, so its attempts are
+		// counted on the owning Job and JobReconcile records them from it, rerunning the count on
+		// every Job status write. The watch records erroring and keeps the recorded Restarts: counting
+		// here would combine this pod with a Job read from another cache, the two can disagree in
+		// either direction, and the watch does not run on the Job status write that would correct it.
+		Describe("restarts", func() {
+			ownedBy := func(pod *corev1.Pod, job *batchv1.Job) {
+				pod.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(job, batchv1.SchemeGroupVersion.WithKind("Job"))}
+			}
+
+			recordedRestarts := func(stage v1alpha1.Stage, recorded int32, pod *corev1.Pod, objects ...client.Object) int32 {
+				node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}
+				sn, err := wrapper.NewSkyhookNodeOnly(node, skyhookName)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(sn.Upsert(pkg.PackageRef, image, v1alpha1.StateInProgress, stage, recorded, "")).To(Succeed())
+
+				r, c := newPodWatch(append([]client.Object{node, pod}, objects...)...)
+				_, err = r.PodReconcile(ctx, pod)
+				Expect(err).ToNot(HaveOccurred())
+
+				var got corev1.Node
+				Expect(c.Get(ctx, types.NamespacedName{Name: nodeName}, &got)).To(Succeed())
+				gsn, err := wrapper.NewSkyhookNodeOnly(&got, skyhookName)
+				Expect(err).ToNot(HaveOccurred())
+				state, err := gsn.State()
+				Expect(err).ToNot(HaveOccurred())
+				Expect(state[pkg.GetUniqueName()].State).To(Equal(v1alpha1.StateErroring))
+				return state[pkg.GetUniqueName()].Restarts
+			}
+
+			It("keeps a package pod's recorded Restarts, whatever the pod and its Job show", func() {
+				// The pod has already shed its tracking finalizer while the cached Job does not count
+				// it yet: read together, the two say no attempt has failed.
+				job := stageJob(v1alpha1.StageApply)
+				job.Status.Active = 1
+				pod := jobOwnedPod("tuning-pod-failed", corev1.ContainerStatus{
+					Name: "apply", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1}},
+				})
+				pod.Status.Phase = corev1.PodFailed
+				ownedBy(pod, job)
+
+				Expect(recordedRestarts(v1alpha1.StageApply, 1, pod, job)).To(Equal(int32(1)))
+			})
+
+			// Interrupt Jobs run restartPolicy OnFailure: the container restarts in place and the
+			// Job's status.failed stays 0, so the container's RestartCount is the attempt count.
+			It("records an interrupt pod's in-place restarts", func() {
+				job := stageJob(v1alpha1.StageInterrupt)
+				job.Status.Active = 1
+				pod := jobOwnedPod("tuning-pod-interrupt", corev1.ContainerStatus{
+					Name: InterruptContainerName, RestartCount: 3,
+					State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
+				})
+				Expect(SetPackages(pod, &v1alpha1.NodeWright{ObjectMeta: metav1.ObjectMeta{Name: skyhookName}}, image, v1alpha1.StageInterrupt, pkg)).To(Succeed())
+				pod.Labels[batchJobNameLabel] = job.Name
+				pod.Spec.RestartPolicy = corev1.RestartPolicyOnFailure
+				pod.Finalizers = []string{batchv1.JobTrackingFinalizer}
+				pod.Status.Phase = corev1.PodPending
+				ownedBy(pod, job)
+
+				Expect(recordedRestarts(v1alpha1.StageInterrupt, 0, pod, job)).To(Equal(int32(3)))
+			})
+		})
+	})
+
+	// Under restartPolicy OnFailure an interrupt's restarts happen in place and never change its
+	// Job's status, so the pod watch is the only place that sees each one, and it is what ends an
+	// interrupt that keeps failing. It must stay silent for everything a successful reboot does.
+	Describe("a crash-looping interrupt", func() {
+		const interruptJobName = "gpu-init-interrupt-service-worker-1"
+		const jobUID = types.UID("interrupt-job-uid")
+
+		crashLooping := corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}}
+		exitedNonzero := corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Reason: "Error"}}
+		running := corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}
+
+		// A service interrupt's Job, stamped with the allowance a jobBackoffLimit of 3 gives: the
+		// same three retries a package stage gets.
+		interruptJob := func() *batchv1.Job {
+			job := &batchv1.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: interruptJobName, Namespace: namespace, UID: jobUID,
+					Labels: map[string]string{
+						nameLabel: skyhookName, packageLabel: "tuning-1.0.0", nodeLabel: nodeName,
+						interruptLabel: interruptLabelValue,
+					},
+					Annotations: map[string]string{annotationRestartAllowance: "3"},
+				},
+				Spec: batchv1.JobSpec{
+					BackoffLimit: ptr(int32(math.MaxInt32)),
+					Template:     corev1.PodTemplateSpec{Spec: corev1.PodSpec{NodeName: nodeName}},
+				},
+			}
+			Expect(SetPackages(job, &v1alpha1.NodeWright{ObjectMeta: metav1.ObjectMeta{Name: skyhookName}}, image, v1alpha1.StageInterrupt, pkg)).To(Succeed())
+			return job
+		}
+
+		interruptPod := func(restarts int32, state corev1.ContainerState) *corev1.Pod {
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: interruptJobName + "-x7k2p", Namespace: namespace,
+					Labels: map[string]string{
+						nameLabel: skyhookName, packageLabel: "tuning-1.0.0", interruptLabel: interruptLabelValue,
+						batchJobNameLabel: interruptJobName, batchControllerUIDLabel: string(jobUID),
+					},
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: "batch/v1", Kind: "Job", Name: interruptJobName, UID: jobUID, Controller: ptr(true),
+					}},
+				},
+				Spec: corev1.PodSpec{NodeName: nodeName, RestartPolicy: corev1.RestartPolicyOnFailure},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodPending,
+					InitContainerStatuses: []corev1.ContainerStatus{{
+						Name: InterruptContainerName, State: state, RestartCount: restarts,
+					}},
+				},
+			}
+			Expect(SetPackages(pod, &v1alpha1.NodeWright{ObjectMeta: metav1.ObjectMeta{Name: skyhookName}}, image, v1alpha1.StageInterrupt, pkg)).To(Succeed())
+			return pod
+		}
+
+		// The node as the heavy pass leaves it when the interrupt starts: package at
+		// (interrupt, in_progress), node status in_progress.
+		nodeWithEntry := func(state v1alpha1.State, stage v1alpha1.Stage) *corev1.Node {
+			node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}
+			sn, err := wrapper.NewSkyhookNodeOnly(node, skyhookName)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(sn.Upsert(pkg.PackageRef, image, state, stage, 0, "")).To(Succeed())
+			sn.SetStatus(v1alpha1.StatusInProgress)
+			return node
+		}
+		startedNode := func() *corev1.Node {
+			return nodeWithEntry(v1alpha1.StateInProgress, v1alpha1.StageInterrupt)
+		}
+
+		nodeWright := func() *v1alpha1.NodeWright {
+			return &v1alpha1.NodeWright{ObjectMeta: metav1.ObjectMeta{Name: skyhookName}}
+		}
+
+		// The pod is also seeded, because the watch re-reads it before ending the Job.
+		newWatch := func(objects ...client.Object) (*PodReconciler, client.Client, *events.FakeRecorder) {
+			_, c := newReconciler(objects...)
+			recorder := events.NewFakeRecorder(50)
+			return NewPodReconciler(c, c, recorder, namespace), c, recorder
+		}
+
+		getJob := func(c client.Client, name string) *batchv1.Job {
+			var job batchv1.Job
+			Expect(c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &job)).To(Succeed())
+			return &job
+		}
+
+		nodeStatus := func(c client.Client) v1alpha1.Status {
+			var node corev1.Node
+			Expect(c.Get(ctx, types.NamespacedName{Name: nodeName}, &node)).To(Succeed())
+			sn, err := wrapper.NewSkyhookNodeOnly(&node, skyhookName)
+			Expect(err).ToNot(HaveOccurred())
+			return sn.Status()
+		}
+
+		warnings := func(recorder *events.FakeRecorder) []string {
+			var out []string
+			for {
+				select {
+				case e := <-recorder.Events:
+					if strings.HasPrefix(e, corev1.EventTypeWarning) {
+						out = append(out, e)
+					}
+				default:
+					return out
+				}
+			}
+		}
+
+		expectEnded := func(c client.Client, restarts string) {
+			job := getJob(c, interruptJobName)
+			Expect(*job.Spec.BackoffLimit).To(Equal(int32(0)), "the Job controller fails the Job on its next sync")
+			Expect(job.Annotations).To(HaveKeyWithValue(annotationRestartLimitExceeded, restarts))
+		}
+
+		expectJobLeftRunning := func(c client.Client, recorder *events.FakeRecorder) {
+			job := getJob(c, interruptJobName)
+			Expect(*job.Spec.BackoffLimit).To(Equal(int32(math.MaxInt32)))
+			Expect(job.Annotations).ToNot(HaveKey(annotationRestartLimitExceeded))
+			Expect(warnings(recorder)).To(BeEmpty())
+		}
+
+		DescribeTable("ends the Job once the interrupt fails past its restart allowance, leaving the node's status alone",
+			func(state corev1.ContainerState) {
+				pod := interruptPod(3, state)
+				r, c, recorder := newWatch(startedNode(), interruptJob(), nodeWright(), pod)
+
+				_, err := r.PodReconcile(ctx, pod)
+				Expect(err).ToNot(HaveOccurred())
+				expectEnded(c, "3")
+
+				emitted := warnings(recorder)
+				Expect(emitted).To(HaveLen(2))
+				Expect(emitted).To(ContainElement(And(ContainSubstring("Warning Interrupt"), ContainSubstring("from [nodewright:"+skyhookName+"]"), ContainSubstring("after 3 restarts"))))
+				Expect(emitted).To(ContainElement(And(ContainSubstring("Warning Interrupt"), ContainSubstring("on node ["+nodeName+"]"), ContainSubstring(interruptJobName))))
+
+				// The verdict on the node is the Job path's to give, once the Job has failed.
+				Expect(nodeStatus(c)).To(Equal(v1alpha1.StatusInProgress))
+			},
+			Entry("waiting in CrashLoopBackOff", crashLooping),
+			Entry("just exited nonzero", exitedNonzero),
+		)
+
+		// The allowance comes from the Job, not the operator's current config, so the limit in force
+		// when the stage started is the one it is held to.
+		DescribeTable("holds the interrupt to the allowance stamped on its Job",
+			func(allowance string, restarts int32, ended bool) {
+				job := interruptJob()
+				job.Annotations[annotationRestartAllowance] = allowance
+				pod := interruptPod(restarts, crashLooping)
+				r, c, recorder := newWatch(startedNode(), job, nodeWright(), pod)
+
+				_, err := r.PodReconcile(ctx, pod)
+				Expect(err).ToNot(HaveOccurred())
+				if ended {
+					expectEnded(c, fmt.Sprint(restarts))
+				} else {
+					expectJobLeftRunning(c, recorder)
+				}
+			},
+			Entry("still within the allowance", "3", int32(2), false),
+			Entry("past the operator's current limit but within a larger allowance stamped at creation", "6", int32(3), false),
+			// jobBackoffLimit 0 stamps 0: a single run, no retry, as for a package stage.
+			Entry("an allowance of 0, at the first failed run", "0", int32(0), true),
+		)
+
+		// Built the way the operator builds them, so the spec covers the stamp as well as the watch.
+		// A reboot's shutdown can kill the agent several times before it takes effect, so it is
+		// never ended here however long it appears to crash-loop.
+		DescribeTable("applies the bound by interrupt type",
+			func(interruptType v1alpha1.InterruptType, ended bool) {
+				nw := &v1alpha1.NodeWright{ObjectMeta: metav1.ObjectMeta{Name: skyhookName, UID: "nw-uid", Generation: 1}}
+				job := createInterruptJobFromPackage(validOpts(), &v1alpha1.Interrupt{Type: interruptType}, "args", pkg,
+					wrapper.NewSkyhookWrapper(nw), nodeName, v1alpha1.StageInterrupt)
+				Expect(setJobPackage(job, nw, image, v1alpha1.StageInterrupt, pkg)).To(Succeed())
+				job.UID = "built-job-uid"
+				pod := interruptPod(10, crashLooping)
+				pod.OwnerReferences = []metav1.OwnerReference{{
+					APIVersion: "batch/v1", Kind: "Job", Name: job.Name, UID: job.UID, Controller: ptr(true),
+				}}
+				r, c, recorder := newWatch(startedNode(), job, nodeWright(), pod)
+
+				_, err := r.PodReconcile(ctx, pod)
+				Expect(err).ToNot(HaveOccurred())
+
+				got := getJob(c, job.Name)
+				if ended {
+					Expect(*got.Spec.BackoffLimit).To(Equal(int32(0)))
+					Expect(got.Annotations).To(HaveKeyWithValue(annotationRestartLimitExceeded, "10"))
+					return
+				}
+				Expect(*got.Spec.BackoffLimit).To(Equal(int32(math.MaxInt32)))
+				Expect(got.Annotations).ToNot(HaveKey(annotationRestartLimitExceeded))
+				Expect(warnings(recorder)).To(BeEmpty())
+			},
+			Entry("a reboot is never ended", v1alpha1.REBOOT, false),
+			Entry("a service restart is", v1alpha1.SERVICE, true),
+			Entry("restartAllServices is", v1alpha1.RESTART_ALL_SERVICES, true),
+		)
+
+		// An interrupt Job from an operator that did not bound interrupts has no stamp, and an
+		// upgrade must not start ending it.
+		It("never ends an interrupt Job created without an allowance", func() {
+			job := interruptJob()
+			delete(job.Annotations, annotationRestartAllowance)
+			pod := interruptPod(10, crashLooping)
+			r, c, recorder := newWatch(startedNode(), job, nodeWright(), pod)
+
+			_, err := r.PodReconcile(ctx, pod)
+			Expect(err).ToNot(HaveOccurred())
+			expectJobLeftRunning(c, recorder)
+		})
+
+		// A running interrupt container has no failure verdict, so a high restart count alone never
+		// ends the Job.
+		It("leaves the Job running for a running interrupt, whatever its restart count", func() {
+			pod := interruptPod(10, running)
+			r, c, recorder := newWatch(startedNode(), interruptJob(), nodeWright(), pod)
+
+			_, err := r.PodReconcile(ctx, pod)
+			Expect(err).ToNot(HaveOccurred())
+			expectJobLeftRunning(c, recorder)
+			Expect(nodeStatus(c)).To(Equal(v1alpha1.StatusInProgress))
+		})
+
+		// The event's copy of the pod can predate a restart. With backoffLimit 0 the Job controller
+		// would fail the Job on its restart count alone, running interrupt or not.
+		It("leaves the Job running when the pod has restarted and is running since the event", func() {
+			live := interruptPod(5, running)
+			r, c, recorder := newWatch(startedNode(), interruptJob(), nodeWright(), live)
+
+			_, err := r.PodReconcile(ctx, interruptPod(3, crashLooping))
+			Expect(err).ToNot(HaveOccurred())
+			expectJobLeftRunning(c, recorder)
+		})
+
+		DescribeTable("leaves the Job running for a pod with no failure verdict",
+			func(pod func() *corev1.Pod) {
+				r, c, recorder := newWatch(startedNode(), interruptJob(), nodeWright())
+
+				_, err := r.PodReconcile(ctx, pod())
+				Expect(err).ToNot(HaveOccurred())
+				expectJobLeftRunning(c, recorder)
+			},
+			Entry("a node crash the kubelet could not account for", func() *corev1.Pod {
+				return interruptPod(10, corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 137, Reason: "ContainerStatusUnknown"}})
+			}),
+			Entry("a disruption casualty", func() *corev1.Pod {
+				pod := interruptPod(10, crashLooping)
+				pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.DisruptionTarget, Status: corev1.ConditionTrue}}
+				return pod
+			}),
+			Entry("a pod being deleted", func() *corev1.Pod {
+				pod := interruptPod(10, crashLooping)
+				pod.DeletionTimestamp = ptr(metav1.Now())
+				return pod
+			}),
+		)
+
+		DescribeTable("leaves alone a Job that is not this crash loop's to end",
+			func(mutate func(*batchv1.Job)) {
+				job := interruptJob()
+				mutate(job)
+				pod := interruptPod(10, crashLooping)
+				r, c, recorder := newWatch(startedNode(), job, nodeWright(), pod)
+
+				_, err := r.PodReconcile(ctx, pod)
+				Expect(err).ToNot(HaveOccurred())
+				expectJobLeftRunning(c, recorder)
+			},
+			Entry("a same-named Job from a later rerun", func(job *batchv1.Job) { job.UID = "successor-uid" }),
+			Entry("a Job that already failed at its deadline", func(job *batchv1.Job) {
+				job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: batchv1.JobReasonDeadlineExceeded}}
+			}),
+			// The deadline has already decided this Job; ending it too would also record and
+			// announce it as a restart-limit failure.
+			Entry("a Job the Job controller is already failing at its deadline", func(job *batchv1.Job) {
+				job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobFailureTarget, Status: corev1.ConditionTrue, Reason: batchv1.JobReasonDeadlineExceeded}}
+			}),
+			Entry("a Job suspended by a pause", func(job *batchv1.Job) { job.Spec.Suspend = ptr(true) }),
+			Entry("a Job already marked invalid for the sweep to reap", func(job *batchv1.Job) {
+				Expect(InvalidatePackage(job)).To(Succeed())
+			}),
+		)
+
+		// The same guard the erroring write uses: a rerun or reset that cleared the entry, or a
+		// package already past this stage, leaves nothing for this pod to fail.
+		DescribeTable("leaves the Job running when the package's entry is no longer at this stage",
+			func(node func() *corev1.Node) {
+				pod := interruptPod(10, crashLooping)
+				r, c, recorder := newWatch(node(), interruptJob(), nodeWright(), pod)
+
+				_, err := r.PodReconcile(ctx, pod)
+				Expect(err).ToNot(HaveOccurred())
+				expectJobLeftRunning(c, recorder)
+			},
+			Entry("cleared by a reset", func() *corev1.Node {
+				return &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}
+			}),
+			Entry("moved past the interrupt", func() *corev1.Node {
+				return nodeWithEntry(v1alpha1.StateInProgress, v1alpha1.StagePostInterrupt)
+			}),
+			Entry("already complete at the interrupt", func() *corev1.Node {
+				return nodeWithEntry(v1alpha1.StateComplete, v1alpha1.StageInterrupt)
+			}),
+		)
+
+		It("never ends a package Job, whose retries its own backoffLimit already bounds", func() {
+			job := stageJob(v1alpha1.StageApply)
+			job.Spec.BackoffLimit = ptr(int32(3))
+			job.Annotations = map[string]string{annotationRestartAllowance: "3"}
+			pod := jobOwnedPod("tuning-pod-failed", corev1.ContainerStatus{
+				Name: "apply", State: exitedNonzero, RestartCount: 10,
+			})
+			pod.OwnerReferences = []metav1.OwnerReference{{APIVersion: "batch/v1", Kind: "Job", Name: job.Name, UID: job.UID, Controller: ptr(true)}}
+			r, c, recorder := newWatch(job, nodeWright(), pod)
+
+			_, err := r.PodReconcile(ctx, pod)
+			Expect(err).ToNot(HaveOccurred())
+
+			got := getJob(c, job.Name)
+			Expect(*got.Spec.BackoffLimit).To(Equal(int32(3)))
+			Expect(got.Annotations).ToNot(HaveKey(annotationRestartLimitExceeded))
+			Expect(warnings(recorder)).To(BeEmpty())
+		})
+
+		It("ends the Job when the reconciler has no uncached reader, re-reading the pod from the cache", func() {
+			pod := interruptPod(3, crashLooping)
+			_, c := newReconciler(startedNode(), interruptJob(), nodeWright(), pod)
+			r := NewPodReconciler(c, nil, events.NewFakeRecorder(50), namespace)
+
+			_, err := r.PodReconcile(ctx, pod)
+			Expect(err).ToNot(HaveOccurred())
+			expectEnded(c, "3")
+		})
+
+		It("is idempotent: a later restart event finds the Job already ended", func() {
+			pod := interruptPod(3, exitedNonzero)
+			r, c, recorder := newWatch(startedNode(), interruptJob(), nodeWright(), pod)
+
+			_, err := r.PodReconcile(ctx, pod)
+			Expect(err).ToNot(HaveOccurred())
+			ended := getJob(c, interruptJobName)
+			Expect(warnings(recorder)).To(HaveLen(2))
+
+			_, err = r.PodReconcile(ctx, interruptPod(3, crashLooping))
+			Expect(err).ToNot(HaveOccurred())
+			Expect(getJob(c, interruptJobName).ResourceVersion).To(Equal(ended.ResourceVersion))
+			Expect(warnings(recorder)).To(BeEmpty())
+		})
+
+		// The verdict is the annotation: someone resetting backoffLimit must not get the Job
+		// patched and announced again.
+		It("treats the verdict annotation alone as the Job already ended", func() {
+			job := interruptJob()
+			job.Annotations[annotationRestartLimitExceeded] = "3"
+			pod := interruptPod(6, crashLooping)
+			r, c, recorder := newWatch(startedNode(), job, nodeWright(), pod)
+
+			_, err := r.PodReconcile(ctx, pod)
+			Expect(err).ToNot(HaveOccurred())
+			got := getJob(c, interruptJobName)
+			Expect(*got.Spec.BackoffLimit).To(Equal(int32(math.MaxInt32)))
+			Expect(got.Annotations).To(HaveKeyWithValue(annotationRestartLimitExceeded, "3"))
+			Expect(warnings(recorder)).To(BeEmpty())
+		})
+
+		// A node-state write that keeps failing must not also keep the crash loop from ending.
+		It("ends the Job even when recording the package's erroring state fails", func() {
+			pod := interruptPod(3, crashLooping)
+			_, base := newReconciler(startedNode(), interruptJob(), nodeWright(), pod)
+			c := interceptor.NewClient(base, interceptor.Funcs{
+				Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+					if _, isNode := obj.(*corev1.Node); isNode {
+						return fmt.Errorf("simulated node patch failure")
+					}
+					return cl.Patch(ctx, obj, patch, opts...)
+				},
+			})
+			r := NewPodReconciler(c, c, events.NewFakeRecorder(50), namespace)
+
+			_, err := r.PodReconcile(ctx, pod)
+			Expect(err).To(MatchError(ContainSubstring("simulated node patch failure")))
+			expectEnded(c, "3")
+		})
+
+		// The fake client accepts any write, so only a real apiserver can show that backoffLimit is
+		// mutable on a running Job built the way the operator builds interrupt Jobs.
+		It("ends a live interrupt Job through the apiserver (envtest)", func() {
+			const envtestNodeWright = "restart-limit-envtest"
+			const envtestNode = "restart-limit-envtest-node"
+			ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
+			if err := k8sClient.Create(ctx, ns); err != nil && !apierrors.IsAlreadyExists(err) {
+				Expect(err).ToNot(HaveOccurred())
+			}
+
+			node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: envtestNode}}
+			sn, err := wrapper.NewSkyhookNodeOnly(node, envtestNodeWright)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(sn.Upsert(pkg.PackageRef, image, v1alpha1.StateInProgress, v1alpha1.StageInterrupt, 0, "")).To(Succeed())
+			Expect(k8sClient.Create(ctx, node)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, node) })
+
+			nw := &v1alpha1.NodeWright{ObjectMeta: metav1.ObjectMeta{Name: envtestNodeWright, UID: "envtest-uid", Generation: 1}}
+			job := createInterruptJobFromPackage(validOpts(), &v1alpha1.Interrupt{Type: v1alpha1.SERVICE, Services: []string{"missing.service"}}, "args", pkg,
+				wrapper.NewSkyhookWrapper(nw), envtestNode, v1alpha1.StageInterrupt)
+			Expect(setJobPackage(job, nw, image, v1alpha1.StageInterrupt, pkg)).To(Succeed())
+			Expect(k8sClient.Create(ctx, job)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground))
+			})
+			Expect(job.Annotations).To(HaveKeyWithValue(annotationRestartAllowance, "3"), "stamped from jobBackoffLimit 3 at creation")
+
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: job.Name + "-x7k2p", Namespace: namespace,
+					Labels:      job.Spec.Template.Labels,
+					Annotations: job.Spec.Template.Annotations,
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: "batch/v1", Kind: "Job", Name: job.Name, UID: job.UID, Controller: ptr(true),
+					}},
+				},
+				Spec: *job.Spec.Template.Spec.DeepCopy(),
+			}
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, pod, client.GracePeriodSeconds(0))
+			})
+			dirInit, interrupt := pod.Spec.InitContainers[0], pod.Spec.InitContainers[1]
+			pod.Status = corev1.PodStatus{
+				Phase: corev1.PodPending,
+				InitContainerStatuses: []corev1.ContainerStatus{
+					{Name: dirInit.Name, Image: dirInit.Image, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+					{Name: InterruptContainerName, Image: interrupt.Image, State: crashLooping, RestartCount: 3},
+				},
+			}
+			Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+			r := NewPodReconciler(k8sClient, k8sClient, events.NewFakeRecorder(50), namespace)
+			_, err = r.PodReconcile(ctx, pod)
+			Expect(err).ToNot(HaveOccurred())
+
+			var got batchv1.Job
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(job), &got)).To(Succeed())
+			Expect(*got.Spec.BackoffLimit).To(Equal(int32(0)))
+			Expect(got.Annotations).To(HaveKeyWithValue(annotationRestartLimitExceeded, "3"))
+		})
+	})
+
+	// handleExistingJob is the AlreadyExists-on-create path, and it must reach the same verdict
+	// as shouldDeleteFinishedJob for the same Job — the two are mirrors, and this path is the one
+	// that runs first: a finished Job does not satisfy JobExists, so the next pass tries to create
+	// over its deterministic name while JobReconcile may not have processed it yet.
+	Describe("handleExistingJob", func() {
+		specWith := func(p v1alpha1.Package) *v1alpha1.NodeWright {
+			return &v1alpha1.NodeWright{
+				ObjectMeta: metav1.ObjectMeta{Name: skyhookName, Namespace: namespace, Generation: 1},
+				Spec:       v1alpha1.NodeWrightSpec{Packages: v1alpha1.Packages{"tuning": p}},
+			}
+		}
+
+		nodeWithEntry := func(state v1alpha1.State, stage v1alpha1.Stage) (*corev1.Node, *v1alpha1.NodeWright) {
+			node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}
+			scr := specWith(*pkg)
+			sn, err := wrapper.NewSkyhookNodeOnly(node, skyhookName)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(sn.Upsert(pkg.PackageRef, image, state, stage, 0, "")).To(Succeed())
+			return node, scr
+		}
+
+		resolve := func(existing *batchv1.Job, state v1alpha1.State) bool {
+			node, scr := nodeWithEntry(state, v1alpha1.StageApply)
+			r, c := newReconciler(node, scr, existing)
+			skyhookNode, err := wrapper.NewSkyhookNode(node, scr)
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(r.handleExistingJob(ctx, existing, pkg, skyhookNode, v1alpha1.StageApply)).To(Succeed())
+
+			var got batchv1.Job
+			err = c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: existing.Name}, &got)
+			if apierrors.IsNotFound(err) {
+				return false
+			}
+			Expect(err).ToNot(HaveOccurred())
+			// foreground deletion leaves the object visible until its children are gone
+			return got.DeletionTimestamp == nil
+		}
+
+		// Built from a package rather than by stageJob: the spec condition on the timed-out
+		// carve-out runs the same comparison validation does, and an empty pod template matches
+		// no package at all.
+		failedFor := func(p v1alpha1.Package, processed bool) *batchv1.Job {
+			job := createJobFromPackage(validOpts(), &p, wrapper.NewSkyhookWrapper(specWith(p)), nodeName, v1alpha1.StageApply)
+			job.Status.Conditions = []batchv1.JobCondition{{
+				Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: batchv1.JobReasonBackoffLimitExceeded,
+			}}
+			if processed {
+				job.Annotations[annotationStateRecorded] = annotationValueTrue
+			}
+			return job
+		}
+		failed := func(processed bool) *batchv1.Job { return failedFor(*pkg, processed) }
+
+		It("keeps a terminal Failed Job JobReconcile has not processed yet", func() {
+			// Deleting here would take the retained attempts with it and restart the stage on a
+			// fresh budget, before anything had a chance to write erroring.
+			Expect(resolve(failed(false), v1alpha1.StateInProgress)).To(BeTrue())
+		})
+		It("keeps a timed-out Job while its entry sits erroring", func() {
+			Expect(resolve(failed(true), v1alpha1.StateErroring)).To(BeTrue())
+		})
+		It("deletes a processed Failed Job whose entry never reached erroring", func() {
+			// The kubelet-refused-every-attempt case: nothing timed the stage out, so the name
+			// frees and the stage re-runs.
+			Expect(resolve(failed(true), v1alpha1.StateInProgress)).To(BeFalse())
+		})
+		It("deletes a timed-out Job built from a superseded spec, so an edit takes effect", func() {
+			// resolve() reconciles against a CR holding the current pkg, so a Job built from an
+			// older image is what the user just edited away from.
+			old := *pkg
+			old.Image = "ghcr.io/nvidia/skyhook-packages/tuning-broken"
+			Expect(resolve(failedFor(old, true), v1alpha1.StateErroring)).To(BeFalse())
+		})
+	})
+
+	Describe("rerun predicate", func() {
+		pkgSky := &PackageSkyhook{PackageRef: pkg.PackageRef, Skyhook: skyhookName, Stage: v1alpha1.StageApply}
+
+		// The spec-drift arm of the predicate compares a Job against the packages in the CR, so
+		// these need a CR to compare with. skyWith(*pkg) is the matching case.
+		skyWith := func(p v1alpha1.Package) SkyhookNodes {
+			scr := &v1alpha1.NodeWright{
+				ObjectMeta: metav1.ObjectMeta{Name: skyhookName, Namespace: namespace, Generation: 1},
+				Spec:       v1alpha1.NodeWrightSpec{Packages: v1alpha1.Packages{"tuning": p}},
+			}
+			return &skyhookNodes{skyhook: wrapper.NewSkyhookWrapper(scr), compartments: make(map[string]*wrapper.Compartment)}
+		}
+		sky := skyWith(*pkg)
+
+		// Built by the real builder, not stageJob: the spec-drift check runs the same comparison
+		// validation does, and stageJob's empty pod template matches no package at all.
+		builtJob := func(condition batchv1.JobCondition) *batchv1.Job {
+			job := createJobFromPackage(validOpts(), pkg, sky.GetSkyhook(), nodeName, v1alpha1.StageApply)
+			job.Status.Conditions = []batchv1.JobCondition{condition}
+			job.Annotations[annotationStateRecorded] = annotationValueTrue
+			return job
+		}
+
+		processed := func() *batchv1.Job {
+			job := stageJob(v1alpha1.StageApply, batchv1.JobCondition{Type: batchv1.JobComplete, Status: corev1.ConditionTrue})
+			job.Annotations = map[string]string{annotationStateRecorded: annotationValueTrue}
+			return job
+		}
+		erroringEntry := v1alpha1.NodeState{pkg.GetUniqueName(): {Name: "tuning", Version: "1.0.0", Stage: v1alpha1.StageApply, State: v1alpha1.StateErroring}}
+		completeEntry := v1alpha1.NodeState{pkg.GetUniqueName(): {Name: "tuning", Version: "1.0.0", Stage: v1alpha1.StageApply, State: v1alpha1.StateComplete}}
+
+		It("deletes a processed finished Job once its stage is no longer recorded done", func() {
+			r, _ := newReconciler()
+			Expect(r.shouldDeleteFinishedJob(processed(), pkgSky, v1alpha1.NodeState{}, sky)).To(BeTrue())
+		})
+		It("keeps a processed finished Job while its stage is recorded complete", func() {
+			r, _ := newReconciler()
+			Expect(r.shouldDeleteFinishedJob(processed(), pkgSky, completeEntry, sky)).To(BeFalse())
+		})
+		// This predicate is what makes a lost node-state update self-healing rather than a stall:
+		// a completion clobbered back to (this stage, in_progress) no longer reads as recorded
+		// done, so the finished Job is torn down and the stage runs again. Distinct from the
+		// absent-entry case above — that is a reset or an uninstall, this is a regression.
+		It("deletes a processed finished Job whose entry was reverted to this stage in_progress", func() {
+			r, _ := newReconciler()
+			reverted := v1alpha1.NodeState{pkg.GetUniqueName(): {Name: "tuning", Version: "1.0.0", Stage: v1alpha1.StageApply, State: v1alpha1.StateInProgress}}
+			Expect(r.shouldDeleteFinishedJob(processed(), pkgSky, reverted, sky)).To(BeTrue())
+		})
+		It("keeps a processed successful uninstall Job after its node-state entry is removed", func() {
+			r, _ := newReconciler()
+			uninstall := *pkgSky
+			uninstall.Stage = v1alpha1.StageUninstall
+			job := stageJob(v1alpha1.StageUninstall, batchv1.JobCondition{Type: batchv1.JobComplete, Status: corev1.ConditionTrue})
+			job.Annotations = map[string]string{annotationStateRecorded: annotationValueTrue}
+			Expect(r.shouldDeleteFinishedJob(job, &uninstall, v1alpha1.NodeState{}, sky)).To(BeFalse())
+		})
+		It("deletes a processed failed uninstall Job after its node-state entry is removed", func() {
+			r, _ := newReconciler()
+			uninstall := *pkgSky
+			uninstall.Stage = v1alpha1.StageUninstall
+			job := stageJob(v1alpha1.StageUninstall, batchv1.JobCondition{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: batchv1.JobReasonBackoffLimitExceeded})
+			job.Annotations = map[string]string{annotationStateRecorded: annotationValueTrue}
+			Expect(r.shouldDeleteFinishedJob(job, &uninstall, v1alpha1.NodeState{}, sky)).To(BeTrue())
+		})
+		// Both outcomes wait for the marker. A finite backoffLimit can take a Job from first
+		// failure to terminal in about a minute, so deleting a Failed Job before JobReconcile
+		// has had its chance to write erroring would race the timeout into a fresh, doomed attempt.
+		DescribeTable("never deletes a finished Job JobReconcile has not processed yet",
+			func(condition batchv1.JobCondition) {
+				r, _ := newReconciler()
+				unprocessed := stageJob(v1alpha1.StageApply, condition)
+				Expect(r.shouldDeleteFinishedJob(unprocessed, pkgSky, v1alpha1.NodeState{}, sky)).To(BeFalse())
+			},
+			Entry("Complete, holding an unrecorded completion",
+				batchv1.JobCondition{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}),
+			Entry("Failed, not yet given its chance to write erroring",
+				batchv1.JobCondition{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: batchv1.JobReasonBackoffLimitExceeded}),
+		)
+		DescribeTable("keeps a timed-out Job while its entry sits erroring, whatever ended it",
+			func(reason string) {
+				r, _ := newReconciler()
+				timedOut := builtJob(batchv1.JobCondition{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: reason})
+				Expect(r.shouldDeleteFinishedJob(timedOut, pkgSky, erroringEntry, sky)).To(BeFalse())
+			},
+			Entry("attempts exhausted", batchv1.JobReasonBackoffLimitExceeded),
+			Entry("whole-stage deadline (interrupt Jobs)", batchv1.JobReasonDeadlineExceeded),
+		)
+		// Without this a stage that has spent its retries sits behind its terminal Job until the
+		// failure TTL, so editing the package to fix what broke it does nothing for up to 24h.
+		DescribeTable("deletes a timed-out Job when the package spec changed, so the fix takes effect",
+			func(edit func(*v1alpha1.Package)) {
+				r, _ := newReconciler()
+				timedOut := builtJob(batchv1.JobCondition{
+					Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: batchv1.JobReasonBackoffLimitExceeded,
+				})
+				edited := *pkg
+				edit(&edited)
+				Expect(r.shouldDeleteFinishedJob(timedOut, pkgSky, erroringEntry, skyWith(edited))).To(BeTrue())
+			},
+			Entry("a new image fixes the broken one", func(p *v1alpha1.Package) {
+				p.Image = "ghcr.io/nvidia/skyhook-packages/tuning-fixed"
+			}),
+			Entry("a version bump", func(p *v1alpha1.Package) { p.Version = "1.0.1" }),
+			Entry("the package left the spec entirely", func(p *v1alpha1.Package) { p.Name = "other" }),
+		)
+		// The generation is not a package change: an edit the Job does not reflect, here a
+		// configMap value, leaves the stage timed out, as it leaves a running Job running.
+		It("keeps a timed-out Job after a spec edit that leaves the package's Job unchanged", func() {
+			r, _ := newReconciler()
+			timedOut := builtJob(batchv1.JobCondition{
+				Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: batchv1.JobReasonBackoffLimitExceeded,
+			})
+			edited := *pkg
+			edited.ConfigMap = map[string]string{"setting": "v2"}
+			editedSky := skyWith(edited)
+			editedSky.GetSkyhook().Generation = 2
+			Expect(r.shouldDeleteFinishedJob(timedOut, pkgSky, erroringEntry, editedSky)).To(BeFalse())
+		})
+		It("deletes a Failed Job whose entry never reached erroring, so the stage re-runs", func() {
+			// The kubelet-refused-every-attempt case: JobReconcile marked it without a state
+			// write, so nothing timed the stage out and the sweep clears the name.
+			r, _ := newReconciler()
+			failed := stageJob(v1alpha1.StageApply, batchv1.JobCondition{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: batchv1.JobReasonBackoffLimitExceeded})
+			failed.Annotations = map[string]string{annotationStateRecorded: annotationValueTrue}
+			inProgress := v1alpha1.NodeState{pkg.GetUniqueName(): {Name: "tuning", Version: "1.0.0", Stage: v1alpha1.StageApply, State: v1alpha1.StateInProgress}}
+			Expect(r.shouldDeleteFinishedJob(failed, pkgSky, inProgress, sky)).To(BeTrue())
+		})
+	})
+
+	Describe("pause suspend cascade", func() {
+		// buildSkyhookNodes wraps a NodeWright (with no packages, so any Job is stale) as the
+		// SkyhookNodes the suspend/resume helpers take. The nodes matter only for the
+		// ValidateRunningPackages ordering test; the plain helpers read only the Skyhook name.
+		buildSkyhookNodes := func(nodes ...corev1.Node) SkyhookNodes {
+			scr := v1alpha1.NodeWright{ObjectMeta: metav1.ObjectMeta{Name: skyhookName, Namespace: namespace}}
+			state, err := BuildState(
+				&v1alpha1.NodeWrightList{Items: []v1alpha1.NodeWright{scr}},
+				&corev1.NodeList{Items: nodes},
+				&v1alpha1.DeploymentPolicyList{},
+			)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(state.skyhooks).To(HaveLen(1))
+			return state.skyhooks[0]
+		}
+
+		// buildDisabledSkyhookNodes is the same wrapper with the disable annotation set, which is
+		// what IsDisabled reads.
+		buildDisabledSkyhookNodes := func() SkyhookNodes {
+			scr := v1alpha1.NodeWright{ObjectMeta: metav1.ObjectMeta{
+				Name: skyhookName, Namespace: namespace,
+				Annotations: map[string]string{v1alpha1.METADATA_PREFIX + "/disable": "true"},
+			}}
+			state, err := BuildState(
+				&v1alpha1.NodeWrightList{Items: []v1alpha1.NodeWright{scr}},
+				&corev1.NodeList{},
+				&v1alpha1.DeploymentPolicyList{},
+			)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(state.skyhooks).To(HaveLen(1))
+			Expect(state.skyhooks[0].IsDisabled()).To(BeTrue(), "fixture must actually read as disabled")
+			return state.skyhooks[0]
+		}
+
+		suspendVal := func(c client.WithWatch, name string) *bool {
+			var got batchv1.Job
+			Expect(c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &got)).To(Succeed())
+			return got.Spec.Suspend
+		}
+
+		invalidate := func(job *batchv1.Job) {
+			Expect(SetPackages(job, &v1alpha1.NodeWright{ObjectMeta: metav1.ObjectMeta{Name: skyhookName}}, image, v1alpha1.StageApply, pkg)).To(Succeed())
+			Expect(InvalidatePackage(job)).To(Succeed())
+		}
+
+		It("suspends an unfinished Job when the Skyhook is paused", func() {
+			job := stageJob(v1alpha1.StageApply)
+			r, c := newReconciler(job)
+			Expect(r.suspendUnfinishedJobs(ctx, buildSkyhookNodes())).To(Succeed())
+			Expect(suspendVal(c, job.Name)).To(HaveValue(BeTrue()))
+		})
+
+		It("does not suspend a finished Job", func() {
+			job := stageJob(v1alpha1.StageApply, batchv1.JobCondition{Type: batchv1.JobComplete, Status: corev1.ConditionTrue})
+			r, c := newReconciler(job)
+			Expect(r.suspendUnfinishedJobs(ctx, buildSkyhookNodes())).To(Succeed())
+			Expect(suspendVal(c, job.Name)).To(BeNil())
+		})
+
+		It("does not suspend an invalid Job (already being reaped)", func() {
+			job := stageJob(v1alpha1.StageApply)
+			invalidate(job)
+			r, c := newReconciler(job)
+			Expect(r.suspendUnfinishedJobs(ctx, buildSkyhookNodes())).To(Succeed())
+			Expect(suspendVal(c, job.Name)).To(BeNil())
+		})
+
+		It("is idempotent — leaves an already-suspended Job unchanged", func() {
+			job := stageJob(v1alpha1.StageApply)
+			job.Spec.Suspend = ptr(true)
+			r, c := newReconciler(job)
+			Expect(r.suspendUnfinishedJobs(ctx, buildSkyhookNodes())).To(Succeed())
+			Expect(suspendVal(c, job.Name)).To(HaveValue(BeTrue()))
+		})
+
+		It("resumes a suspended Job when the Skyhook is no longer paused", func() {
+			job := stageJob(v1alpha1.StageApply)
+			job.Spec.Suspend = ptr(true)
+			r, c := newReconciler(job)
+			Expect(r.resumeSuspendedJobs(ctx, buildSkyhookNodes(), nil)).To(Succeed())
+			Expect(suspendVal(c, job.Name)).To(HaveValue(BeFalse()))
+		})
+
+		// Disable must not un-suspend what pause stopped. Clearing the pause annotation and setting
+		// disable in one edit used to resume every suspended Job, so disabling a paused Skyhook
+		// restarted it — disable ending up strictly weaker than pause.
+		It("does not resume a disabled Skyhook's suspended Jobs", func() {
+			job := stageJob(v1alpha1.StageApply)
+			job.Spec.Suspend = ptr(true)
+			r, c := newReconciler(job)
+
+			Expect(r.resumeSuspendedJobs(ctx, buildDisabledSkyhookNodes(), nil)).To(Succeed())
+
+			Expect(suspendVal(c, job.Name)).To(HaveValue(BeTrue()),
+				"a disabled Skyhook must never restart work pause stopped")
+		})
+
+		It("leaves an invalid suspended Job suspended (validation reaps it before resume clears it)", func() {
+			job := stageJob(v1alpha1.StageApply)
+			job.Spec.Suspend = ptr(true)
+			invalidate(job)
+			r, c := newReconciler(job)
+			Expect(r.resumeSuspendedJobs(ctx, buildSkyhookNodes(), nil)).To(Succeed())
+			// still suspended — resume must not un-suspend a stale-spec Job before it is reaped
+			Expect(suspendVal(c, job.Name)).To(HaveValue(BeTrue()))
+		})
+
+		It("is a no-op with only a legacy pod present (legacy pods cannot suspend)", func() {
+			legacy := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "legacy-tuning", Namespace: namespace,
+					Labels: map[string]string{nameLabel: skyhookName, packageLabel: "tuning-1.0.0"},
+				},
+				Spec: corev1.PodSpec{NodeName: nodeName},
+			}
+			r, _ := newReconciler(legacy)
+			Expect(r.suspendUnfinishedJobs(ctx, buildSkyhookNodes())).To(Succeed())
+		})
+
+		It("holds the pass for an already-invalid stale Job without patching it again", func() {
+			// The Job is waiting on JobReconcile to delete it. Patching it again races that delete,
+			// but update must stay true so the pass does not run on before the Job's name is free.
+			job := stageJob(v1alpha1.StageApply)
+			Expect(SetPackages(job, &v1alpha1.NodeWright{ObjectMeta: metav1.ObjectMeta{Name: skyhookName}}, image, v1alpha1.StageApply, pkg)).To(Succeed())
+			invalidate(job)
+
+			node := corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}
+			r, c := newReconciler(job)
+			var before batchv1.Job
+			Expect(c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: job.Name}, &before)).To(Succeed())
+
+			update, err := r.ValidateRunningPackages(ctx, buildSkyhookNodes(node), nil)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(update).To(BeTrue())
+
+			var after batchv1.Job
+			Expect(c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: job.Name}, &after)).To(Succeed())
+			Expect(after.ResourceVersion).To(Equal(before.ResourceVersion), "the Job must not be patched again")
+		})
+
+		It("invalidates a stale suspended Job without clearing suspend (resume ordering guard)", func() {
+			// A suspended Job whose package is no longer in spec (edited while paused). Validation must
+			// mark it invalid and return update=true — which makes the reconcile loop early-return
+			// BEFORE resumeSuspendedJobs runs — and must not clear suspend, so no stale-spec attempt
+			// launches before JobReconcile reaps it.
+			job := stageJob(v1alpha1.StageApply)
+			job.Spec.Suspend = ptr(true)
+			Expect(SetPackages(job, &v1alpha1.NodeWright{ObjectMeta: metav1.ObjectMeta{Name: skyhookName}}, image, v1alpha1.StageApply, pkg)).To(Succeed())
+
+			node := corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeName}}
+			r, c := newReconciler(job)
+			// empty Packages spec => the Job matches nothing => stale
+			update, err := r.ValidateRunningPackages(ctx, buildSkyhookNodes(node), nil)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(update).To(BeTrue())
+
+			var got batchv1.Job
+			Expect(c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: job.Name}, &got)).To(Succeed())
+			invalid, err := IsInvalidPackage(&got)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(invalid).To(BeTrue())                     // validation marked it invalid...
+			Expect(got.Spec.Suspend).To(HaveValue(BeTrue())) // ...and left suspend untouched
+		})
+	})
+})

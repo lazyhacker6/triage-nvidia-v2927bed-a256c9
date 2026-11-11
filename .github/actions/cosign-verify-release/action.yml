@@ -1,0 +1,170 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# WHY THE SUBJECTS ARE ASYMMETRIC
+#
+# For a multi-platform image this action verifies two different subjects in one
+# run, which reads like a mistake until you know what each piece of evidence
+# claims:
+#
+#   Signature        index digest     "this artifact is ours"
+#   SLSA provenance  index digest     "this artifact came out of that build"
+#   CycloneDX SBOM   platform digest  "this root filesystem contains these packages"
+#   OpenVEX          platform digest  "those packages are/are not exploitable here"
+#
+# A signature and a provenance statement are about the artifact as a whole, and
+# the index is what a user pulls, so they belong on the index. An SBOM and a VEX
+# document each describe exactly one root filesystem (or, for the CLI, one
+# binary), and no two platforms share one, so an SBOM on the index would
+# describe no child truthfully. cosign-attest-multiplatform therefore publishes
+# SBOM and VEX against the platform manifests, and verification has to follow
+# them there: platform-digests takes that action's output unchanged.
+#
+# The Helm chart takes the other path. It is a single OCI artifact with no
+# platform children, so platform-digests is left empty and every check runs
+# against the one subject, which is also what this action did before the split.
+# Nothing to split means nothing to follow.
+
+name: Cosign verify release subject
+description: Verify release signature, CycloneDX SBOM and OpenVEX attestations, and SLSA v1 provenance.
+
+inputs:
+  subject-name:
+    description: OCI repository without tag or digest.
+    required: true
+  subject-digest:
+    description: >-
+      OCI digest in sha256:<hex> form. For a multi-platform image this is the
+      index digest, which carries the signature and the SLSA provenance.
+    required: true
+  platform-digests:
+    description: >-
+      Space-separated <os>/<arch>=<digest> pairs naming the platform manifests
+      that carry the SBOM and VEX attestations, as cosign-attest-multiplatform
+      outputs them. Leave empty for a single-platform subject such as the Helm
+      chart, which keeps all evidence on subject-digest.
+    required: false
+    default: ""
+  certificate-identity-regexp:
+    description: Expected Fulcio certificate identity regexp.
+    required: true
+  certificate-oidc-issuer:
+    description: Expected Fulcio OIDC issuer.
+    required: false
+    default: "https://token.actions.githubusercontent.com"
+  openvex-identity-regexp:
+    description: >-
+      Identity regexp the OpenVEX attestations are verified against, when it
+      differs from certificate-identity-regexp. vex-reattest.yaml replaces a
+      released image's OpenVEX attestation with one it signs itself, so a job
+      that re-verifies an already-released image (an NGC copy re-run) passes an
+      alternation that also accepts that workflow. Empty means
+      certificate-identity-regexp.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install cosign
+      uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      with:
+        # Kept equal to the cosign-version default in
+        # .github/actions/cosign-attest-multiplatform. The signing side pins the
+        # binary so --new-bundle-format means what it says; verification reads
+        # the layout signing produced, so it has to be pinned to the same
+        # release rather than to whatever the installer currently defaults to.
+        cosign-release: "v3.1.3"
+
+    - name: Verify release subject
+      shell: bash
+      env:
+        SUBJECT_NAME: ${{ inputs.subject-name }}
+        SUBJECT_DIGEST: ${{ inputs.subject-digest }}
+        PLATFORM_DIGESTS: ${{ inputs.platform-digests }}
+        CERTIFICATE_IDENTITY_REGEXP: ${{ inputs.certificate-identity-regexp }}
+        CERTIFICATE_OIDC_ISSUER: ${{ inputs.certificate-oidc-issuer }}
+        OPENVEX_IDENTITY_REGEXP: ${{ inputs.openvex-identity-regexp }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "${SUBJECT_NAME}" ]; then
+          echo "::error::subject-name is required"
+          exit 1
+        fi
+        if ! [[ "${SUBJECT_DIGEST}" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+          echo "::error::subject-digest must be in sha256:<64 hex> form"
+          exit 1
+        fi
+
+        # A malformed or missing entry is the dangerous case, not an obvious
+        # one: the loop below verifies only what it is given, so a dropped
+        # platform would skip that SBOM and VEX check while the job still
+        # reports success. An empty list cannot be rejected here, because it is
+        # how the Helm chart asks for single-subject verification. Completeness
+        # comes from passing the attest action's output through unchanged,
+        # which the release-policy tests pin for every multi-platform caller.
+        platform_digests=()
+        for pair in ${PLATFORM_DIGESTS}; do
+          if ! [[ "${pair}" =~ ^[a-z0-9]+/[a-z0-9]+=sha256:[a-f0-9]{64}$ ]]; then
+            echo "::error::platform-digests entry '${pair}' is not in <os>/<arch>=sha256:<64 hex> form"
+            exit 1
+          fi
+          platform_digests+=("${pair#*=}")
+        done
+
+        # --new-bundle-format is explicit on every verify-attestation because
+        # the signing side passes it explicitly too. Its default has moved
+        # between cosign releases, and a default flip on either side would look
+        # like a missing attestation rather than a format mismatch.
+        # Every cosign call is bounded, matching the attest action. These reach
+        # both the registry and Sigstore's TUF root, so a hung call would hold
+        # the release job open until the workflow's own timeout rather than
+        # failing it. Verification runs last, after the artifacts are already
+        # pushed, which is the worst point at which to hang.
+        verify_attestation() {
+          predicate_type="$1"
+          target="$2"
+          identity="${CERTIFICATE_IDENTITY_REGEXP}"
+          if [ "${predicate_type}" = "openvex" ] && [ -n "${OPENVEX_IDENTITY_REGEXP:-}" ]; then
+            identity="${OPENVEX_IDENTITY_REGEXP}"
+          fi
+          timeout --foreground 120s cosign verify-attestation \
+            --certificate-identity-regexp "${identity}" \
+            --certificate-oidc-issuer "${CERTIFICATE_OIDC_ISSUER}" \
+            --new-bundle-format=true \
+            --type "${predicate_type}" \
+            "${target}"
+        }
+
+        subject="${SUBJECT_NAME}@${SUBJECT_DIGEST}"
+
+        timeout --foreground 120s cosign verify \
+          --certificate-identity-regexp "${CERTIFICATE_IDENTITY_REGEXP}" \
+          --certificate-oidc-issuer "${CERTIFICATE_OIDC_ISSUER}" \
+          --new-bundle-format=true \
+          "${subject}"
+
+        if [ "${#platform_digests[@]}" -eq 0 ]; then
+          verify_attestation cyclonedx "${subject}"
+        else
+          for digest in "${platform_digests[@]}"; do
+            verify_attestation cyclonedx "${SUBJECT_NAME}@${digest}"
+            verify_attestation openvex "${SUBJECT_NAME}@${digest}"
+          done
+        fi
+
+        verify_attestation https://slsa.dev/provenance/v1 "${subject}"

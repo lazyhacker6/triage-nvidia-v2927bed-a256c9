@@ -1,0 +1,862 @@
+# The NodeWright Custom Resource
+
+The `NodeWright` custom resource is the declarative description of work you want
+done on hosts: which nodes to touch, what to run on them, and how fast to roll it
+out. This page is the field-by-field reference. Where a field has a guide of its
+own, this page gives you the shape and the gotcha and links to that guide.
+
+`NodeWright` is **cluster-scoped**. The install namespace determines only where
+the operator and its package pods live, never which resources a client can see.
+
+```yaml
+apiVersion: nodewright.nvidia.com/v1alpha1
+kind: NodeWright
+```
+
+> **Legacy group.** The `skyhook.nvidia.com/v1alpha1 Skyhook` kind still exists,
+> read-only, for a migration window. Field names and semantics are identical —
+> everything on this page applies to both. See
+> [Migration from Skyhook](../getting-started/migration.md).
+
+---
+
+## A complete example
+
+Every field, in one resource. Almost nothing here is required — see the tables
+below for what you can drop.
+
+```yaml
+apiVersion: nodewright.nvidia.com/v1alpha1
+kind: NodeWright
+metadata:
+  name: gpu-tuning
+  annotations:
+    nodewright.nvidia.com/pause: "false"    # "true" stops this and everything after it
+    nodewright.nvidia.com/disable: "false"  # "true" skips this one and keeps going
+spec:
+  # --- targeting: which nodes -------------------------------------------
+  nodeSelectors:
+    matchLabels:
+      nvidia.com/gpu.present: "true"
+    matchExpressions:
+      - key: node-role.kubernetes.io/control-plane
+        operator: DoesNotExist
+
+  # --- rollout shape: how many at once ----------------------------------
+  interruptionBudget:
+    percent: 10          # or count: 5 — never both, and never with deploymentPolicy
+
+  # deploymentPolicy: gpu-rollout          # mutually exclusive with interruptionBudget
+  # deploymentPolicyOptions:
+  #   resetBatchStateOnCompletion: true
+
+  # --- ordering ---------------------------------------------------------
+  priority: 200          # lower runs first
+  sequencing: node       # or "all" for a cluster-wide barrier
+  serial: false          # true = one package at a time per node
+
+  # --- interrupt handling -----------------------------------------------
+  podNonInterruptLabels:
+    matchLabels:
+      workload: training   # these pods must leave before drain starts
+
+  drainConfig:
+    disableEviction: false
+    deleteEmptyDirData: true
+    force: true
+    ignoreDaemonSets: true
+    timeout: 10m
+    gracePeriod: 30s
+
+  additionalTolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+
+  # --- gating new nodes -------------------------------------------------
+  runtimeRequired: true
+  autoTaintNewNodes: true
+
+  # --- the work ---------------------------------------------------------
+  packages:
+    tuning:                                    # map key IS the package name
+      version: 1.2.3
+      image: ghcr.io/nvidia/skyhook-packages/tuning
+      containerSHA: sha256:0000000000000000000000000000000000000000000000000000000000000000
+      agentImageOverride: ghcr.io/nvidia/nodewright/agent:6.4.2
+      gracefulShutdown: 5m
+      stageTimeout: 30m
+      env:
+        - name: TUNING_PROFILE
+          value: throughput
+      resources:
+        cpuRequest: 100m
+        cpuLimit: 500m
+        memoryRequest: 128Mi
+        memoryLimit: 512Mi
+      configMap:
+        tuning.conf: |
+          vm.swappiness=1
+        network.properties: |
+          net.core.somaxconn=1024
+      configInterrupts:
+        tuning.conf:
+          type: service
+          services: [containerd]
+        "*.properties":                        # only '*' is supported
+          type: restartAllServices
+      interrupt:
+        type: reboot
+      uninstall:
+        enabled: true
+        apply: false
+
+    dependent-package:
+      version: 0.1.0
+      image: ghcr.io/nvidia/skyhook-packages/dependent
+      dependsOn:
+        tuning: 1.2.3                          # name: version
+```
+
+---
+
+## `spec` reference
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| [`nodeSelectors`](#specnodeselectors) | LabelSelector | `{}` — **all nodes** | Which nodes this resource applies to. |
+| [`interruptionBudget`](#specinterruptionbudget) | object | 100% — **all matching nodes at once** | How many matching nodes may be worked on concurrently. |
+| [`deploymentPolicy`](#specdeploymentpolicy-and-specdeploymentpolicyoptions) | string | none | Name of a `DeploymentPolicy` for compartment-based rollout. Mutually exclusive with `interruptionBudget`. |
+| [`deploymentPolicyOptions`](#specdeploymentpolicy-and-specdeploymentpolicyoptions) | object | none | Per-resource overrides of the referenced policy. |
+| [`priority`](#specpriority-and-specsequencing) | int ≥ 1 | `200` | Order across NodeWrights; lower runs first. |
+| [`sequencing`](#specpriority-and-specsequencing) | `node` \| `all` | `node` | Whether priority is enforced per-node or cluster-wide. |
+| [`serial`](#specserial) | bool | `false` | Run one package at a time per node instead of in parallel. |
+| [`podNonInterruptLabels`](#specpodnoninterruptlabels) | LabelSelector | `{}` — **no pods** | Pods that must leave a node before drain begins. |
+| [`drainConfig`](#specdrainconfig) | object | see below | Tunes how nodes are drained before interrupt stages. |
+| [`additionalTolerations`](#specadditionaltolerations) | []Toleration | none | Tolerations added to every package pod. |
+| [`runtimeRequired`](#specruntimerequired-and-specautotaintnewnodes) | bool | `false` | Node must complete this resource before workloads may run. |
+| [`autoTaintNewNodes`](#specruntimerequired-and-specautotaintnewnodes) | bool | `false` | Operator applies the runtime-required taint to new matching nodes. Only meaningful with `runtimeRequired: true`. |
+| [`packages`](#packages) | map[string]Package | none | The DAG of work to apply. |
+
+---
+
+## Targeting: which nodes get this
+
+Three mechanisms decide whether a given node is worked on, and they compose in
+this order:
+
+1. **`nodeSelectors`** picks the candidate set out of the whole cluster.
+2. **The deployment policy** (or `interruptionBudget`) decides which of those
+   candidates are in the current batch.
+3. **The ignore label** blocks individual nodes that were selected anyway.
+
+### `spec.nodeSelectors`
+
+A standard Kubernetes `LabelSelector` — `matchLabels`, `matchExpressions`, or
+both — evaluated against **node** labels.
+
+```yaml
+spec:
+  nodeSelectors:
+    matchLabels:
+      nvidia.com/gpu.present: "true"
+    matchExpressions:
+      - key: node-role.kubernetes.io/control-plane
+        operator: DoesNotExist
+```
+
+**An empty or omitted `nodeSelectors` matches every node in the cluster.** This
+is the single most common way to accidentally roll something out everywhere; it
+is not an error and the webhook will not warn you.
+
+Node labels are re-evaluated continuously. Relabelling a node into the selector
+enrolls it; relabelling it out removes it from the resource's scope, which is a
+different thing from uninstalling the packages it already received — the host
+changes stay. Use [explicit uninstall](uninstall.md) to actually reverse work.
+
+### The `nodewright.nvidia.com/ignore` label
+
+Set on a **node**, this tells the operator to leave that node alone:
+
+```bash
+kubectl label node <node> nodewright.nvidia.com/ignore=true
+```
+
+The value must be exactly the string `"true"`. Any other value — including
+`"True"` or `"1"` — is treated as not ignored.
+
+What it does, precisely:
+
+- The node still matches `nodeSelectors` and counts toward the population used
+  to calculate the interruption-budget ceiling and batch size. It does **not**
+  hold a concurrency slot, even if its package Job is still running. The label
+  does not cancel an already-running Job.
+- Its `NodePriority` entry and package state are preserved. Other eligible batch
+  members finish before new nodes are selected; removing the ignore label makes
+  the node eligible to resume in its sticky place.
+- Ignoring a cordoned node does not uncordon it. After un-ignoring, normal
+  processing resumes and releases this NodeWright's cordon on completion. For
+  manual recovery, see [Orphaned Cordon Recovery](../architecture/interrupt-flow.md#orphaned-cordon-recovery);
+  reset alone does not clear `spec.unschedulable`.
+- An unfinished node's status is set to **`blocked`**, and the NodeWright gets a
+  `NodesIgnored` condition set to `True` naming the ignored nodes (truncated to a
+  count when the list is long).
+- Because the node is blocked rather than complete, a NodeWright with
+  `sequencing: all` will never finish while an ignored node is in scope, and
+  everything behind it in priority order waits. Use `disable` on the NodeWright,
+  or take the node out of `nodeSelectors`, if that is not what you want.
+
+The label applies to **all** NodeWrights targeting that node — it is a property
+of the node, not of any one resource. It is the right tool for quarantining a
+node you are debugging by hand; it is the wrong tool for permanently excluding a
+class of nodes, which belongs in `nodeSelectors`.
+
+### `spec.deploymentPolicy` and `spec.deploymentPolicyOptions`
+
+`deploymentPolicy` names a cluster-scoped `DeploymentPolicy` that replaces the
+flat interruption budget with **compartments** — named node selectors, each with
+its own ceiling and batch strategy (fixed, linear, or exponential), so a rollout
+can advance cautiously and back off on failures.
+
+```yaml
+spec:
+  deploymentPolicy: gpu-rollout
+  deploymentPolicyOptions:
+    resetBatchStateOnCompletion: true
+```
+
+Two constraints worth knowing before you reach for it:
+
+- `deploymentPolicy` and `interruptionBudget` are **mutually exclusive** — the
+  webhook rejects a resource that sets both.
+- The named policy must already exist. The webhook rejects a reference to a
+  missing policy on create, and a NodeWright whose policy is deleted out from
+  under it goes `blocked`.
+
+`deploymentPolicyOptions` currently carries a single override,
+`resetBatchStateOnCompletion`, which wins over the policy's own setting for this
+NodeWright only.
+
+Full reference — compartments, strategy parameters, overlapping selectors,
+tie-breaking, batch stickiness and reset:
+**[Deployment Policy and Compartments](deployment-policy.md)**.
+
+---
+
+## Rollout control
+
+### `spec.interruptionBudget`
+
+How many matching nodes may be in progress at once. Exactly one of `percent` or
+`count`:
+
+```yaml
+spec:
+  interruptionBudget:
+    percent: 10     # 0-100
+    # count: 5      # setting both is rejected by the webhook
+```
+
+**Omitting `interruptionBudget` entirely means 100% — every matching node at
+once.** Combined with an empty `nodeSelectors`, that is a whole-cluster
+simultaneous rollout. Set a budget deliberately.
+
+`percent` is computed against the number of nodes matching `nodeSelectors` and
+floors to a minimum of one node, so a small percentage on a small cluster still
+makes progress rather than stalling.
+
+### `spec.serial`
+
+```yaml
+spec:
+  serial: false
+```
+
+By default the operator starts every package whose dependencies are satisfied at
+the same time on a given node. With `serial: true` it applies one package per
+node per reconcile pass instead, re-queuing to pick up the next. A package
+waiting at a [merged interrupt](#interrupt) for other packages to reach theirs
+runs nothing meanwhile, so the operator moves on to those packages rather than
+stopping at it, and the node is still interrupted once for all of them.
+
+This is about packages **within** one node, not about how many nodes run at
+once. **`serial` will not roll out one node at a time** — for that, set
+`interruptionBudget.count: 1`, or give the NodeWright a `deploymentPolicy` whose
+strategy has a batch size of 1 (a `fixed` strategy with `initialBatch: 1`; the
+`linear` and `exponential` strategies grow the batch after a successful round).
+
+Reach for `serial` when packages contend for the same host resource — a package
+manager lock, a device — in a way `dependsOn` cannot express, and accept that a
+node takes proportionally longer to converge.
+
+### `spec.priority` and `spec.sequencing`
+
+```yaml
+spec:
+  priority: 200     # minimum 1, lower runs first
+  sequencing: node  # or "all"
+```
+
+`priority` orders NodeWrights against each other. `sequencing: node` (the
+default) lets each node move past this resource independently as soon as it
+completes there; `sequencing: all` holds every node at this priority until all
+nodes finish, making it a cluster-wide barrier — and a deadlock risk if
+misapplied.
+
+Recommended priority buckets, node ordering within a rollout
+(`SKYHOOK_NODE_ORDER`), mixing sequencing modes, and the deadlock cases:
+**[Strict Ordering](../architecture/ordering.md)**.
+
+### `spec.podNonInterruptLabels`
+
+A `LabelSelector` over **pods**. Pods matching it are treated as
+non-interruptible: they must complete or move off the node on their own before
+the operator begins draining it.
+
+```yaml
+spec:
+  podNonInterruptLabels:
+    matchLabels:
+      workload: training
+```
+
+This is a barrier that runs *before* the configurable drain — it is not a drain
+exclusion. The operator will wait indefinitely for a matching pod that never
+finishes. This wait is unbounded and drain timeout does not apply.
+
+While a node is held it stays cordoned and keeps its slot in the compartment's
+current batch, so the compartment starts no new batch until the node completes.
+A held node can read `waiting` or `in_progress`, and `Ready` can read `Waiting`
+or `Progressing`, so neither identifies a hold. The Warning event on the Node
+does. The `Blocked` condition with reason `NonInterruptPodsRunning` lists every
+node whose protected pods would block its drain, picked or not, and is absent
+while another `Blocked` reason, such as `DependencyUninstalled`, holds the
+condition. The held nodes are the cordoned ones with the Warning event. See
+[What a held node costs the
+rollout](../architecture/interrupt-flow.md#what-a-held-node-costs-the-rollout).
+If a few nodes host long-running workloads, select them into a compartment of
+their own with a [deployment policy](deployment-policy.md) so that a hold stalls
+only that compartment.
+
+**Note the asymmetry with `nodeSelectors`:** an empty `podNonInterruptLabels` is
+special-cased to mean *no pods are protected*, not *all of them*. The two fields
+are both `LabelSelector`s and both default to `{}`, but leaving this one empty is
+the safe outcome, where leaving `nodeSelectors` empty is the dangerous one.
+
+Sequence details: **[Interrupt Flow](../architecture/interrupt-flow.md)**.
+
+### `spec.drainConfig`
+
+Tunes the drain that precedes interrupt stages. Only meaningful for packages that
+declare an `interrupt`.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `disableEviction` | bool | `false` | Delete pods directly instead of evicting. **Bypasses PodDisruptionBudgets.** |
+| `deleteEmptyDirData` | bool | `true` | When `false`, pods with `emptyDir` volumes block drain. |
+| `force` | bool | `true` | When `false`, pods with no managing controller block drain. |
+| `ignoreDaemonSets` | bool | `true` | Skip DaemonSet-managed pods. |
+| `timeout` | duration | none | Bounds the whole drain. Unset or `0` means **no timeout**. |
+| `gracePeriod` | duration | pod's own | Overrides `terminationGracePeriodSeconds` for evict/delete. |
+
+Drain waits for selected pods to actually disappear, not merely for their
+evictions to be accepted — so workload termination grace periods are on the
+critical path of every interrupt, and a pod stuck terminating holds the node in
+`in_progress` forever unless `timeout` is set. On timeout the node goes
+`erroring` and no package stages run on it.
+
+Which pods the operator never drains, and how to recover from a drain timeout:
+**[Interrupt Flow → Drain Configuration](../architecture/interrupt-flow.md#drain-configuration)**.
+
+### `spec.additionalTolerations`
+
+Standard Kubernetes tolerations added to **every** package pod this resource
+creates.
+
+```yaml
+spec:
+  additionalTolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+```
+
+Package pods must tolerate every taint on a target node or they will not
+schedule. A node whose taints are not tolerated is marked `blocked` and the
+NodeWright reports a `TaintNotTolerable` condition — that condition is usually
+the answer when a node is selected but nothing happens on it. The operator adds a
+set of default tolerations on your behalf; `additionalTolerations` extend those.
+Admission tolerates the cordon and runtime-required taints. A current-batch node
+with package State `in_progress` or `erroring` also tolerates the lifecycle taints
+`node.kubernetes.io/not-ready` and `node.kubernetes.io/unreachable` with
+`NoSchedule` or `NoExecute` effects. A reboot therefore does not release its
+interruption-budget slot. A member that lost its slot
+before any stage started gets no such exemption. These lifecycle taints block
+admission to a fresh batch unless explicitly tolerated.
+
+This includes a failed interrupt attempt while its Job still retries.
+Terminal erroring stages also retain this exemption.
+Releasing those slots remains the separate [#869](https://github.com/NVIDIA/nodewright/issues/869) follow-up.
+
+Package and interrupt pods have unbounded lifecycle `NoExecute` tolerations to
+survive a reboot. An explicit matching `additionalTolerations` entry takes
+precedence, including a finite `tolerationSeconds` eviction timeout.
+
+See **[Taints](taints.md)** for the defaults and the common symptoms.
+
+### `spec.runtimeRequired` and `spec.autoTaintNewNodes`
+
+```yaml
+spec:
+  runtimeRequired: true
+  autoTaintNewNodes: true
+```
+
+`runtimeRequired: true` declares that this NodeWright must be complete on a node
+before general workloads may run there. Nodes are expected to join the cluster
+already carrying the runtime-required taint; the operator removes it only once
+the work is done.
+
+`autoTaintNewNodes` lets the operator apply that taint itself to **new** matching
+nodes — where "new" means a node carrying no `nodewright.nvidia.com/*`
+annotations. It is a one-way judgement: once the operator has touched a node, it
+is never "new" again, so this does not retroactively protect existing nodes and
+does not re-taint a node you have reset by hand.
+
+Prerequisites, the taint key rename, and what `runtimeRequired` will *not* do:
+**[Runtime Required](runtime-required.md)**.
+
+---
+
+## Packages
+
+`spec.packages` is a map of package name to package definition, forming a DAG via
+`dependsOn`.
+
+```yaml
+spec:
+  packages:
+    tuning:              # the map key is the package name
+      version: 1.2.3
+      image: ghcr.io/nvidia/skyhook-packages/tuning
+```
+
+**The map key is the name.** Do not also set `name:` inside the package body —
+the webhook rejects it. Names must match `^[a-z][-a-z0-9]{0,41}[a-z]$` (max 43
+characters).
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| [`version`](#version-image-and-containersha) | string | ✓ | Semver. Drives upgrade/downgrade detection and supplies the image tag. |
+| [`image`](#version-image-and-containersha) | string | ✓ | Bare `registry/repository` reference — **no tag, no digest**. |
+| [`containerSHA`](#version-image-and-containersha) | string | | `sha256:<64 hex>`. Pins the exact image bytes. |
+| [`interrupt`](#interrupt) | object | | Interrupt to run after this package applies. |
+| [`dependsOn`](#dependson) | map[string]string | | `name: version` of packages that must complete first. |
+| [`configMap`](#configmap-and-configinterrupts) | map[string]string | | Configuration delivered to the package. |
+| [`configInterrupts`](#configmap-and-configinterrupts) | map[string]Interrupt | | Interrupt to run when a given config key changes. Key may be a `*` glob. |
+| [`env`](#env) | []EnvVar | | Environment variables for the package container. |
+| [`agentImageOverride`](#agentimageoverride) | string | | Fully-qualified agent image for this package only. |
+| [`resources`](#resources) | object | | CPU/memory requests and limits. All four or none. |
+| [`gracefulShutdown`](#gracefulshutdown) | duration | | Pod `terminationGracePeriodSeconds` for this package. |
+| [`stageTimeout`](#stagetimeout) | duration | | Bounds one attempt at each stage. |
+| [`uninstall`](#uninstall) | object | | Explicit uninstall support. |
+
+### `version`, `image`, and `containerSHA`
+
+These three are one mechanism, split across three fields, and the split is
+enforced:
+
+```yaml
+version: 1.2.3
+image: ghcr.io/nvidia/skyhook-packages/tuning
+containerSHA: sha256:0000…0000
+```
+
+- **`image` must be a bare repository reference.** An inline tag
+  (`…/tuning:1.2.3`) or digest (`…/tuning@sha256:…`) is **rejected** by the
+  webhook, not silently stripped. A colon before the final `/` is read as a
+  registry port, so `localhost:5000/org/pkg` is fine.
+- **`version` supplies the tag** and is the operator's ordering key — it is how
+  upgrade, downgrade, and fresh-apply are told apart, which is why it cannot live
+  in the image string. It must be valid semver;
+  [versioning is strictly enforced](../operations/versioning.md).
+- **`containerSHA` pins the bytes.** When set, the kubelet pulls that digest
+  instead of the version tag. `version` still drives lifecycle decisions, so
+  bumping the SHA without bumping the version does not trigger an upgrade.
+
+Downgrades are restricted: for a package with `uninstall.enabled: true`, the
+webhook rejects a version decrease unless the package was explicitly uninstalled
+first. See [Uninstall](uninstall.md#downgrade-version-change).
+
+### `dependsOn`
+
+```yaml
+dependent-package:
+  version: 0.1.0
+  image: ghcr.io/nvidia/skyhook-packages/dependent
+  dependsOn:
+    tuning: 1.2.3
+```
+
+A map of package name to version. Both parts matter — the version string may not
+be empty. The operator builds a dependency graph across the whole `packages` map
+and refuses the resource if it is not a valid DAG (cycles, or a dependency on a
+package that is not defined). Packages with no unmet dependencies run in
+parallel unless [`serial`](#specserial) says otherwise.
+
+### `configMap` and `configInterrupts`
+
+`configMap` is the configuration handed to the package. The operator copies this
+map verbatim into a Kubernetes ConfigMap, so the keys are **ConfigMap keys**:
+alphanumerics, `-`, `_`, and `.` only, with values that are valid UTF-8.
+
+**A key cannot contain `/`.** Keys are filenames, not paths — `sysctl.d/99.conf`
+is rejected by the apiserver when the operator creates the ConfigMap. Where the
+file lands on the host is the package's business, not the key's.
+
+```yaml
+configMap:
+  tuning.conf: |
+    vm.swappiness=1
+  network.properties: |
+    net.core.somaxconn=1024
+configInterrupts:
+  tuning.conf:
+    type: service
+    services: [containerd]
+  "*.properties":
+    type: restartAllServices
+```
+
+`configInterrupts` maps a config key to the interrupt that should run **when that
+specific key changes** — so editing a value that only needs a service bounce does
+not cost you a node reboot, while the key that does need one still gets it.
+
+- A key may be a literal config key or a glob. **Only `*` is supported** as a
+  metacharacter.
+- Every entry must match at least one key actually present in `configMap`. A
+  literal key that does not exist, or a glob that matches nothing, is rejected by
+  the webhook — this catches the typo that would otherwise silently skip an
+  interrupt.
+- A config change adds to the package's own [`interrupt`](#interrupt), it does not
+  replace it: on a node where the package's own interrupt has not yet run, that
+  interrupt still runs, merged with the matching `configInterrupts` entries.
+
+#### When a configMap change applies
+
+A configMap change is held until every node has finished the package and has
+no unfinished package Job, or the
+package is `erroring` at `config`, `interrupt` or `post-interrupt` on some node.
+When it applies, every
+node at those stages or already complete goes back to `config`, including nodes
+still running, and the package's unfinished Jobs on those nodes are deleted. An
+interrupt cut short this way, a reboot included, has not completed, so it runs
+again after `config`.
+
+While the change is held, the CR shows the new `configMap` but the package's
+ConfigMap, `<nodewright>-<package>-<version>` in the operator namespace, still
+holds the old data, and nothing on the CR's `status` says so. The operator checks
+again on each reconcile, at most 30 seconds apart, so the change lands on the
+first pass after the gate opens. A package pod reads its config files when it
+starts, because each key is mounted with `subPath`, so even a ConfigMap update
+never reaches a pod that is already running; it takes effect when the next stage
+starts a pod. The change is also held while the NodeWright is paused or while the
+package is mid-uninstall on any node, whatever the gate says.
+
+Until the package is erroring at one of those stages, the operator waits for
+every node to finish rather than applying the change mid-run, for two reasons:
+
+- **A package step leaves the host in a known state only when it runs to the
+  end.** Applying new config mid-run means ending the running pod partway through
+  a step, possibly with half its work done, so the current run is allowed to
+  finish first.
+- **The finished nodes move from one config to the next together.** Swapping the
+  ConfigMap as each node becomes free would leave some nodes on the old config and
+  some on the new, with no record of which is which.
+
+A package `erroring` at `config`, `interrupt` or `post-interrupt` on some node
+opens the gate without that wait, so running nodes at those stages are reset as
+described above. Nodes still at `apply` or `upgrade` are never reset. An
+already-running pod there keeps the old data, but a replacement pod for a retry
+can mount the updated ConfigMap. The node reaches `config` after that stage
+completes.
+
+Whether editing the configMap unsticks a package depends on where it is stuck:
+
+- **Erroring at `config`, `interrupt` or `post-interrupt`:** the change applies
+  on the next pass, as above.
+- **Erroring at `apply` or `upgrade`:** a package erroring there neither
+  finishes nor opens the gate, so the change waits. If the cause is on the host, fix it
+  and delete the failed Job; the stage runs again, still on the old config. If
+  the config itself is the cause, change the package's `version`: a new version
+  gets a new ConfigMap, written from the current `configMap` straight away. The
+  version is also the image tag unless `containerSHA` is set, so publish the
+  image under the new tag first, and expect every node with the package, finished
+  ones included, to run `upgrade`, `config` and any interrupt it declares again.
+- **Still running:** if the package is still running, let it finish or fail. To end a failing interrupt sooner,
+  see [A failing interrupt](#a-failing-interrupt).
+
+For secrets, do **not** put them in `configMap`. See
+[Providing Secrets to Packages](providing-secrets.md).
+
+### `interrupt`
+
+```yaml
+interrupt:
+  type: service
+  services: [containerd, kubelet]
+```
+
+| `type` | What runs on the host |
+|---|---|
+| `reboot` | `reboot` |
+| `service` | `systemctl daemon-reload`, then `systemctl restart <s>` per entry in `services` |
+| `restartAllServices` | `service procps force-reload` |
+| `noop` | Nothing — the package's own scripts are expected to have handled it |
+
+`services` is only meaningful for `type: service`.
+
+Declaring any interrupt changes the package's lifecycle: the node is cordoned and
+drained first, and the stages become
+**Apply → Config → Interrupt → Post-Interrupt**.
+
+**Interrupts coalesce.** When several packages with interrupts are runnable on
+the same node at the same time, that is, every package each of them names in
+[`dependsOn`](#dependson) is already complete, the operator merges their
+interrupts into a single one, ranked `reboot` > `restartAllServices` > `service` > `noop`. Two `service`
+interrupts at the same rank merge their `services` lists; a `reboot` anywhere in
+the set wins outright and the node reboots once instead of restarting services
+and then rebooting. So the interrupt a node actually experiences may be stronger
+than the one this package declares.
+
+The merged interrupt waits until every one of those packages has finished its
+`config` and reached its `interrupt` stage, so a slower package's apply and
+config always run before it, never after. A package that fails before its
+interrupt does not hold it, and neither does a package without an interrupt,
+whose remaining stages may run after it. A package that becomes runnable only
+after the merged interrupt has started, because a package it depends on
+completed then, is not part of it.
+
+Full sequence and rationale: **[Interrupt Flow](../architecture/interrupt-flow.md)**.
+
+### `env`
+
+```yaml
+env:
+  - name: TUNING_PROFILE
+    value: throughput
+```
+
+Standard Kubernetes `EnvVar` entries — including `valueFrom` for secret and
+configmap references — added to the package container. The operator appends its
+own agent configuration variables (`SKYHOOK_RESOURCE_ID`, node order, and
+friends) after yours; see [`agent/README.md`](../../agent/README.md) for those
+names, and avoid reusing them.
+
+### `agentImageOverride`
+
+```yaml
+agentImageOverride: ghcr.io/nvidia/nodewright/agent:6.4.2
+```
+
+Overrides, for this package only, the agent image the operator would otherwise
+inject from its own environment. Unlike `image`, this is a **fully-qualified
+reference including the tag**. Useful for pinning one package to an older agent
+during an agent upgrade; not something to set routinely.
+
+### `resources`
+
+```yaml
+resources:
+  cpuRequest: 100m
+  cpuLimit: 500m
+  memoryRequest: 128Mi
+  memoryLimit: 512Mi
+```
+
+**All four fields or none.** Setting a subset is rejected. Limits must be greater
+than or equal to their matching request, and all values must be positive. Without
+an override, packages inherit the namespace `LimitRange` defaults.
+
+See **[Resource Management](../operations/resource-management.md)**.
+
+### `gracefulShutdown`
+
+```yaml
+gracefulShutdown: 5m
+```
+
+Sets the package pod's `terminationGracePeriodSeconds`. Unset uses the Kubernetes
+default (30s). Raise it for a package whose scripts must not be killed
+mid-operation; note that this is how long the node will wait when the pod is
+being torn down.
+
+### `stageTimeout`
+
+```yaml
+stageTimeout: 30m
+```
+
+Bounds the wall-clock runtime of **one attempt** at each of this package's stages. An attempt that overruns is killed and retried like any other failure; the package surfaces as `erroring` once the operator's retry budget (`JOB_BACKOFF_LIMIT`) is spent. Unset uses the operator default (`JOB_STAGE_TIMEOUT`, 1h unless configured otherwise).
+
+Four things about this field are easy to get wrong:
+
+- **It bounds an attempt, not the stage.** Total time spent on a stage is roughly
+  `stageTimeout × retries`, not `stageTimeout`.
+- **Interrupt stages are the exception.** Their attempt must span a reboot, so there the value bounds the whole stage instead. It is the only bound on a failing reboot interrupt; every other interrupt is ended sooner by its retry budget. See [A failing interrupt](#a-failing-interrupt).
+- **`0` removes the time bound**, leaving the retry budget as the only limit, and the budget is only spent by attempts that *fail*. An attempt that hangs never fails, so with `0` it hangs forever. A reboot interrupt has no retry budget at all, so with `0` a failing reboot never ends: its package's State reads `erroring`, but the node's Status stays `in_progress`.
+- **It is fixed when the stage's Job is created.** The bound lives on the Job's
+  pod template, which Kubernetes makes immutable, so editing the field does not
+  affect work already running. To apply a new value now, clear the Job —
+  `kubectl nodewright package rerun <package>`, or delete the Job — otherwise it
+  takes effect at the package's next stage.
+
+One case no `stageTimeout` covers: a pod the kubelet never acknowledges. The
+attempt clock runs from the pod's start time, which such a pod never gets, so it
+is unbounded at any value. It shows up as a stage stuck `in_progress` with a
+`Pending` pod, and it is node health rather than stage health.
+
+#### A failing interrupt
+
+An interrupt's Job restarts the interrupt in place rather than replacing its pod, because a reboot interrupt's own shutdown kills its container and the restart after the node returns is what completes the stage. How a failing interrupt is bounded depends on its type. When several packages on a node interrupt together they share one interrupt Job, and that Job runs a reboot if any of them reboots.
+
+**Every interrupt except a reboot** (`service`, `restartAllServices`, `noop`) gets the same retry budget as any other stage, counted in the interrupt container's restarts: `JOB_BACKOFF_LIMIT` (chart value `jobBackoffLimit`, default 3). The budget is fixed when the interrupt's Job is created and recorded on it as the annotation `nodewright.nvidia.com/restart-allowance`, like every other Job setting, so changing `JOB_BACKOFF_LIMIT` does not move the bound of an interrupt already running. When the interrupt fails again with its restarts at the budget, as a `service` interrupt naming a unit that does not exist will, the operator fails the interrupt Job and the node reads `erroring`, like any other stage that ran out of retries. The budget is the container's restart count, so restarts that were not failures spend it too, such as an unplanned node reboot or a container recreated after the container runtime restarts. The Job is ended only while the interrupt is failing, though: a running interrupt is never ended, however many restarts it took to get there. The operator also cannot judge an interrupt whose node carries a malformed `nodewright.nvidia.com/nodeState_<name>` annotation, so such an interrupt is bounded only by its deadline until the annotation is repaired.
+
+The verdict comes at the first failed run the operator observes once the restarts have reached the budget: when every run has failed, the first run and `JOB_BACKOFF_LIMIT` restarts. The kubelet restarts a failed container at once the first time, then waits 10 seconds before the next restart, doubling each time up to 5 minutes by default. With the default of 3 that is four failed runs and 0 + 10 + 20 = 30 seconds of backoff, plus the time each run takes to fail. With `JOB_BACKOFF_LIMIT` set to `"0"` the verdict comes at the first or the second failed run: the kubelet's immediate first restart often has the container running again before the operator can confirm the first failure.
+
+**A reboot** is never counted that way. Its shutdown can kill the agent before the reboot takes effect, once or several times while a slow shutdown proceeds, and none of that is a failure. A successful reboot completes in one of two ways: the agent exits successfully as the shutdown begins, so its container is not restarted, or the shutdown kills the container first and the restart after the node returns completes the stage. A reboot interrupt is therefore bounded only by its Job's deadline: the package's `stageTimeout`, or the operator's `JOB_STAGE_TIMEOUT` (chart value `jobStageTimeout`, default 1h) when the package sets none. A reboot that fails, such as one that never takes effect, keeps its node cordoned, drained, and `in_progress` until that deadline. An interrupt Job has no deadline when the package sets `stageTimeout: 0`, or leaves `stageTimeout` unset on an operator whose `JOB_STAGE_TIMEOUT` is `"0"`; a failing reboot then never ends. Its package's State reads `erroring`, but the node's Status stays `in_progress`, so its DeploymentPolicy batch is never evaluated and `failureThreshold` never counts it. Give every package that declares a reboot interrupt a finite `stageTimeout` that covers a reboot.
+
+The deadline bounds every other interrupt too, and is the backstop for one that hangs instead of failing. Interrupt Jobs created by an operator release without the retry budget carry no `restart-allowance` annotation and are bounded only by their deadline.
+
+Until the verdict, the failure shows only on the package's State, not on the node's Status: the node stays cordoned, drained, and `in_progress`, and a DeploymentPolicy batch containing it is not yet evaluated. `kubectl nodewright package status <package> --nodewright <name> -o wide` reports the package at stage `interrupt` (or `uninstall-interrupt`) with state `erroring` and a `RESTARTS` count that keeps rising, and the interrupt pod sits in `Init:CrashLoopBackOff` (`kubectl get pods -n <operator-namespace> -l nodewright.nvidia.com/interrupt=True`). A reboot interrupt's own shutdown can also show as `erroring` with `RESTARTS` at 1 once the node returns; that is expected, and the next invocation completes the stage.
+
+When the operator ends an interrupt for its retry budget, it emits a `Warning` event with reason `Interrupt` and action `RestartLimitExceeded` on both the Node and the NodeWright, naming the interrupt Job, and the Job is `Failed` with reason `BackoffLimitExceeded` and carries the annotation `nodewright.nvidia.com/restart-limit-exceeded` with the restart count it was ended at. An interrupt Job that reaches its deadline instead is `Failed` with reason `DeadlineExceeded`. Either way its pod is deleted when the Job fails, so its logs go with it; the last run's output stays in the agent's host-side logs on the node, under `<agentLogRoot>/<nodewright name>` (chart value `agentLogRoot`, operator env `AGENT_LOG_ROOT`, default `/var/log/skyhook`). A container that never started, such as one blocked on a missing ConfigMap, leaves no host log: its reason survives only in the pod's events until they expire, or in the NodeWright's `ImagePullFailed` event for an image that cannot be pulled. The node then reads `erroring`, its batch is evaluated, and `failureThreshold` counts it. The node stays cordoned and drained, and the failed Job stays in place so the stage does not run again on its own until one of the steps below, or until the failed Job's TTL (`JOB_TTL_FAILED`, chart value `jobTtlFailed`, default 24h) expires and the interrupt runs again.
+
+To end a failing interrupt sooner, or to run it again after the verdict:
+
+- **Fix the cause on the host.** Before the verdict, the next in-place restart completes the stage. After it, follow the fix with one of the steps below.
+- **Delete the failed interrupt Job.** The package's State still reads `erroring` at its stage, so the operator creates a fresh interrupt Job, exactly as when the failed Job's TTL expires. This is also the way to retry a failing `uninstall-interrupt`.
+- **Rerun the package** (stage `interrupt` only). `kubectl nodewright package rerun <package> --nodewright <name> --node <node>` clears the package's state on the node, and the operator deletes the interrupt Job that no longer matches it. Rerunning with `--stage interrupt` works only after the verdict: before it, the package is already at that stage, so the running Job still matches it.
+- **Reset the node or the NodeWright** (stage `interrupt` only). `kubectl nodewright node reset <node> --nodewright <name>` or `kubectl nodewright reset <name>` clears the node state, with the same effect on the Job.
+- **Change the package's `version` or `agentImageOverride`, or remove the package.** The Job no longer matches the spec, so the operator deletes it. Editing only the package's `interrupt` block does not do this: an interrupt Job is not compared against the interrupt it runs. For a package with `uninstall.enabled: true` the admission webhook rejects a removal while any node still holds the package's state, which a node with a failing interrupt always does, and rejects a downgrade until the uninstall has completed on every node.
+
+A failing `uninstall-interrupt` cannot be ended by a rerun or a reset. Both remove the package's entry, an absent entry reads as already uninstalled, and so the operator abandons the uninstall interrupt rather than running it again; `package rerun --stage` cannot target `uninstall-interrupt` either. Fix the cause and delete the failed Job instead.
+
+A configMap change retries the package's own interrupt only on a node that still owes it. When the package's configMap changes while it is `erroring` at `config`, `interrupt` or `post-interrupt` on any node, the operator resets every node at those stages or already complete, not only the erroring one: it deletes the package's unfinished Jobs on each, an interrupt still running on a healthy node included, and sends the package back through `config` with the changed keys recorded (see [`configMap` and `configInterrupts`](#configmap-and-configinterrupts)). On a node where the package's own `interrupt` has not yet run (the node's `interruptPending` flag is still set; it is cleared once the interrupt completes or the package reaches `post-interrupt`), that interrupt still runs after `config`, merged with any `configInterrupts` entry matching the changed keys; the highest-priority one wins (a `reboot` over a service restart). On a node where it already ran, only the matching `configInterrupts` entries decide whether an interrupt runs, so a change that matches none completes at `config` without one. A package whose node entry predates the `interruptPending` flag reads as already done. A configMap change is not applied at all while the package is mid-uninstall.
+
+### `uninstall`
+
+```yaml
+uninstall:
+  enabled: true    # this package ships uninstall.sh / uninstall_check.sh
+  apply: false     # flip to true to actually uninstall it everywhere
+```
+
+`enabled` declares the capability; `apply` triggers the workflow on all target
+nodes. Setting `apply: true` without `enabled: true` is rejected. Setting `apply`
+back to `false` cancels a pending uninstall (the webhook warns rather than
+rejects).
+
+Removing an `enabled: true` package from `spec.packages` before its uninstall has
+completed is **rejected** — uninstall first, then remove.
+
+Workflows, finalizer-driven cleanup on CR deletion, DAG interaction, and known
+issues: **[Uninstall](uninstall.md)**.
+
+---
+
+## Controlling a live rollout
+
+Two annotations on the NodeWright change flow without editing the spec — which
+means toggling them does not bump `metadata.generation`:
+
+| Annotation | Effect |
+|---|---|
+| `nodewright.nvidia.com/disable` | Skip this NodeWright. Nodes continue on to NodeWrights further down the priority order. |
+| `nodewright.nvidia.com/pause` | Stop at this NodeWright. Nothing after it in priority order proceeds on that node either. |
+
+```bash
+kubectl annotate nodewright gpu-tuning nodewright.nvidia.com/pause=true --overwrite
+# or, equivalently
+kubectl nodewright lifecycle pause gpu-tuning
+```
+
+`pause` was once a spec field and has moved to annotations. Note the CLI is
+version-gated on this — see the compatibility matrix in
+**[CLI Reference](cli.md)**.
+
+To exclude a *node* rather than a NodeWright, use
+[the ignore label](#the-nodewrightnvidiacomignore-label).
+
+---
+
+## Validation rules
+
+The admission webhook rejects a `NodeWright` that violates any of these. Most are
+worth knowing before you hit them:
+
+### Resource level
+
+- `deploymentPolicy` and `interruptionBudget` are both set.
+- `deploymentPolicy` names a policy that does not exist.
+- `interruptionBudget` sets both `percent` and `count`.
+- `drainConfig.timeout` or `drainConfig.gracePeriod` is negative.
+- `nodeSelectors` or `podNonInterruptLabels` is not a valid label selector.
+- `priority` is less than 1, or `sequencing` is not `node` or `all`.
+
+### Package level
+
+- `name` is set inside the package body (it comes from the map key).
+- A package name does not match `^[a-z][-a-z0-9]{0,41}[a-z]$`.
+- `version` is not valid semver.
+- `image` contains an inline tag or digest, is empty, or contains whitespace.
+- `containerSHA` is not `sha256:` followed by 64 lowercase hex characters.
+- `interrupt.type` is not one of `service`, `reboot`, `noop`,
+  `restartAllServices`.
+- A `configInterrupts` key matches no key in `configMap`.
+- `resources` sets some but not all four fields; a limit is below its request; or
+  any value is not positive.
+- `stageTimeout` is negative.
+- `uninstall.apply: true` with `uninstall.enabled: false`.
+- The `dependsOn` graph is not a valid DAG, or a `dependsOn` version is empty.
+
+### Update only
+
+- A package with `uninstall.enabled: true` is removed from the spec before its
+  uninstall completed.
+- A package with `uninstall.enabled: true` is downgraded without an explicit,
+  completed uninstall first.
+
+---
+
+## What about `status`?
+
+`status` is not a knob — it is the operator's published observation of the world,
+and the operator re-derives it from the cluster on every reconcile rather than
+reading it back as truth. Editing it does not change behavior.
+
+It is worth reading, though: `status.nodeState` and `status.nodeStatus` are how
+you find out what a rollout is actually doing, and the `conditions` list carries
+`NodesIgnored`, `TaintNotTolerable`, and `DeploymentPolicyNotFound` — usually the
+fastest answer to "why is nothing happening on this node".
+
+Per-node execution state is persisted as annotations on the **Node**
+(`nodewright.nvidia.com/nodeState_<name>`), not on the NodeWright.
+
+For the Status / State / Stage vocabulary and what each value means:
+**[Operator Status Definitions](../architecture/operator-status.md)**.
+
+---
+
+## See also
+
+- [Deployment Policy and Compartments](deployment-policy.md)
+- [Interrupt Flow](../architecture/interrupt-flow.md)
+- [Strict Ordering](../architecture/ordering.md)
+- [Runtime Required](runtime-required.md)
+- [Taints](taints.md)
+- [Uninstall](uninstall.md)
+- [Providing Secrets to Packages](providing-secrets.md)
+- [Resource Management](../operations/resource-management.md)
+- [Versioning](../operations/versioning.md)
+- [CLI Reference](cli.md)

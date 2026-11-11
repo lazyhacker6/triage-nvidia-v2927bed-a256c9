@@ -1,0 +1,134 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Inactive PR Reminder
+
+# Nudges PRs idle 7-13 days, the window before stale.yaml marks PRs stale at 14,
+# so authors get a reminder before the stale bot fires. A PR gets one reminder
+# per stall, not one per lifetime: after a reminder, it is reminded again only
+# once someone has commented, reviewed or pushed and it has gone idle again.
+# The fork guard keeps the scheduled job from running on forks.
+
+on:
+  schedule:
+    - cron: '0 7 * * *'  # daily at 07:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+
+jobs:
+
+  remind:
+    name: Nudge Inactive PRs
+    if: github.repository == 'NVIDIA/nodewright'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    timeout-minutes: 10
+    steps:
+      - name: Check for inactive PRs
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        with:
+          script: |
+            const now = new Date();
+            const msPerDay = 86400000;
+            const skipLabels = ['lifecycle/frozen', 'do-not-merge'];
+            const isBot = (user) => user?.type === 'Bot';
+            // Latest of a list of ISO timestamps, in ms; 0 when there are none.
+            const latest = (dates) => Math.max(0, ...dates.map(d => Date.parse(d) || 0));
+            // This workflow's own reminder, matched on author and message so
+            // another bot's wording cannot pass for it.
+            const isReminder = (e) =>
+              e.event === 'commented' &&
+              e.actor?.login === 'github-actions[bot]' &&
+              /this PR has been inactive for \d+ days\./.test(e.body ?? '');
+            // When a timeline event counts as activity on the PR, else null. Keep
+            // this an explicit list: the reminder itself adds `mentioned` and
+            // `subscribed` events whose actor is the PR author.
+            const activityTime = (e) => {
+              switch (e.event) {
+                case 'commented':
+                case 'head_ref_force_pushed':
+                  return isBot(e.actor) ? null : e.created_at;
+                case 'reviewed':
+                  return isBot(e.user) ? null : e.submitted_at;
+                case 'committed':
+                  // A plain push has no timestamp in the API, so use the commit's
+                  // own date; rebases, amends and merges from main refresh it.
+                  return e.committer?.date;
+                default:
+                  return null;
+              }
+            };
+
+            const prs = await github.paginate(github.rest.pulls.list, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              sort: 'updated',
+              direction: 'asc',
+              per_page: 100,
+            });
+
+            for (const pr of prs) {
+              // Skip PRs explicitly held open or parked.
+              if (pr.labels.some(l => skipLabels.includes(l.name))) continue;
+
+              const updated = new Date(pr.updated_at);
+              const daysInactive = Math.floor((now - updated) / msPerDay);
+
+              // Target the 7-13 day window, before the stale bot fires at 14.
+              if (daysInactive < 7 || daysInactive >= 14) continue;
+
+              // One reminder per stall: skip if the latest reminder is newer than
+              // the latest comment, review or force-push from a person, or the
+              // latest commit. Bot comments (CodeRabbit, the signing check) are
+              // not activity, so they never re-arm it. Paginate so nothing past
+              // page 1 is missed.
+              const timeline = await github.paginate(github.rest.issues.listEventsForTimeline, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                per_page: 100,
+              });
+              const lastReminder = latest(timeline.filter(isReminder).map(e => e.created_at));
+              if (lastReminder) {
+                // The timeline leaves out replies in review threads, so read
+                // inline review comments separately.
+                const reviewComments = await github.paginate(github.rest.pulls.listReviewComments, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: pr.number,
+                  per_page: 100,
+                });
+                const lastActivity = latest([
+                  ...timeline.map(activityTime),
+                  ...reviewComments.filter(c => !isBot(c.user)).map(c => c.created_at),
+                ]);
+                if (lastReminder > lastActivity) continue;
+              }
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                body: `@${pr.user.login} this PR has been inactive for ${daysInactive} days. Do you need help finishing it, or should we close it for now? Feel free to reopen anytime.`,
+              });
+            }

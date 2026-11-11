@@ -1,0 +1,131 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# GitHub label definitions for Skyhook (NodeWright).
+# Sync to GitHub with: make labels
+#
+# This file is the desired set of labels for this repo: a label that is not
+# defined here should not exist on GitHub. Note that `make labels` creates and
+# updates, but never deletes, so a label created by hand lingers until someone
+# removes it and GitHub may currently carry undeclared extras. If you need a new
+# label, add it here in a PR rather than creating it with `gh label create`.
+#
+# Label categories:
+#   Type:      issue Type (Bug/Enhancement/Documentation/Task/Epic/Initiative) is
+#              a native GitHub Issue Type set by the org, not a label
+#   Priority:  a native GitHub issue Field set by maintainers, not a label
+#   Triage:    needs-triage, cleared once a maintainer triages
+#   Component: which part of the project is affected
+#   Lifecycle: stale automation and freeze exemptions
+#   Standard:  common GitHub labels
+
+# ── Type ──────────────────────────────────────────────────────────────────────
+# Bug / Enhancement / Documentation / Task / Epic / Initiative are native GitHub
+# Issue Types (org-level), assigned by the issue forms via their `type:` key, not
+# labels. `doc` stays as a label because the PR path labeler applies it to
+# docs-only PRs (issues use the Documentation type instead).
+
+- name: "doc"
+  color: "0075ca"
+  description: "Documentation change (PR path label; doc issues use the Documentation type)"
+
+# ── Priority ─────────────────────────────────────────────────────────────────
+# Priority is a native GitHub issue Field (Urgent / High / Medium / Low), set
+# from the Fields section of the issue sidebar. It is deliberately NOT modelled
+# as a label and is NOT collected by the issue forms: prioritization is a
+# maintainer call made during triage, not something a reporter self-declares.
+# Do not add priority/*, P0/P1/P2, or severity labels here.
+
+# ── Triage ───────────────────────────────────────────────────────────────────
+# Applied automatically to new issues; removed once a maintainer triages.
+
+- name: "needs-triage"
+  color: "fbca04"
+  description: "Awaiting initial triage by a maintainer"
+
+# ── Component ────────────────────────────────────────────────────────────────
+# Which part of the project is affected. Applied automatically by issue triage
+# and PR path labeling. Each component gets a distinct hue so they pop apart at
+# a glance; the "component/" prefix keeps them grouped in label lists.
+
+- name: "component/operator"
+  color: "0969da"
+  description: "Skyhook operator (controller-manager)"
+
+- name: "component/agent"
+  color: "1a7f37"
+  description: "Skyhook agent (package executor)"
+
+- name: "component/chart"
+  color: "8250df"
+  description: "Helm chart"
+
+- name: "component/cli"
+  color: "bc4c00"
+  description: "kubectl-nodewright CLI plugin"
+
+- name: "component/ci"
+  color: "bf3989"
+  description: "CI workflows, GitHub Actions, and repo tooling"
+
+- name: "component/tests"
+  color: "9a6700"
+  description: "End-to-end / chainsaw test suites (k8s-tests)"
+
+# ── Lifecycle ─────────────────────────────────────────────────────────────────
+# Used by stale automation
+
+- name: "lifecycle/stale"
+  color: "b4b4b4"
+  description: "No activity for 90+ days. Will be closed after 30 more days."
+
+- name: "lifecycle/frozen"
+  color: "0e8a16"
+  description: "Exempt from stale automation. Use for intentionally long-running issues."
+
+# ── Standard ─────────────────────────────────────────────────────────────────
+
+- name: "good first issue"
+  color: "7057ff"
+  description: "Good for newcomers to the project"
+
+- name: "help wanted"
+  color: "008672"
+  description: "Extra attention or outside contribution is welcome"
+
+- name: "duplicate"
+  color: "cfd3d7"
+  description: "This issue or PR already exists"
+
+- name: "invalid"
+  color: "e4e669"
+  description: "This doesn't seem right"
+
+- name: "wontfix"
+  color: "ffffff"
+  description: "This will not be worked on"
+
+- name: "do-not-merge"
+  color: "b60205"
+  description: "PR should not be merged in its current state"
+
+- name: "needs-rebase"
+  color: "b60205"
+  description: "PR has merge conflicts with main and needs a rebase"
+
+- name: "dependencies"
+  color: "0366d6"
+  description: "Dependency update (Dependabot or Renovate)"

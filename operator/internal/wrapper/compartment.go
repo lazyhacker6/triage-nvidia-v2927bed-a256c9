@@ -1,0 +1,441 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package wrapper
+
+import (
+	"github.com/NVIDIA/nodewright/operator/api/nodewright/v1alpha1"
+)
+
+// Compartment invariant: all nodes in a Compartment belong to the same Skyhook.
+// Compartments are populated per-Skyhook in BuildState and partitionNodesIntoCompartments,
+// so node.GetSkyhook() returns the same Skyhook for every node in the compartment.
+
+func NewCompartmentWrapper(c *v1alpha1.Compartment, batchState *v1alpha1.BatchProcessingState) *Compartment {
+	comp := &Compartment{
+		Compartment: *c,
+	}
+
+	if batchState != nil {
+		comp.BatchState = *batchState
+	} else {
+		comp.BatchState = v1alpha1.BatchProcessingState{
+			CurrentBatch: 1,
+		}
+	}
+
+	return comp
+}
+
+type Compartment struct {
+	v1alpha1.Compartment
+	nodes []SkyhookNode
+	// BatchState tracks the persistent batch processing state
+	BatchState v1alpha1.BatchProcessingState
+
+	nodeNames map[string]struct{}
+}
+
+func (c *Compartment) GetName() string {
+	return c.Name
+}
+
+func (c *Compartment) GetNodes() []SkyhookNode {
+	return c.nodes
+}
+
+func (c *Compartment) GetNode(name string) SkyhookNode {
+	for _, node := range c.nodes {
+		if node.GetNode().Name == name {
+			return node
+		}
+	}
+	return nil
+}
+
+func (c *Compartment) AddNode(node SkyhookNode) {
+	name := node.GetNode().Name
+	if _, ok := c.nodeNames[name]; ok {
+		return
+	}
+	if c.nodeNames == nil {
+		c.nodeNames = make(map[string]struct{})
+	}
+	c.nodeNames[name] = struct{}{}
+	c.nodes = append(c.nodes, node)
+}
+
+// ClearNodes removes all nodes from the compartment
+func (c *Compartment) ClearNodes() {
+	c.nodes = make([]SkyhookNode, 0)
+	c.nodeNames = nil
+}
+
+// CalculateCeiling is a public helper to calculate ceiling from budget and matched nodes
+func CalculateCeiling(budget v1alpha1.DeploymentBudget, matched int) int {
+	if budget.Count != nil {
+		return *budget.Count
+	}
+	if budget.Percent != nil {
+		if matched == 0 {
+			return 0
+		}
+		limit := float64(*budget.Percent) / 100
+		return max(1, int(float64(matched)*limit))
+	}
+	return 0
+}
+
+func (c *Compartment) getInProgressCount() int {
+	inProgress := 0
+	for _, node := range c.nodes {
+		if node.Status() == v1alpha1.StatusInProgress {
+			inProgress++
+		}
+	}
+	return inProgress
+}
+
+// GetNodesForNextBatch filters selection without changing persisted batch membership.
+// A nil eligibility predicate admits every node.
+func (c *Compartment) GetNodesForNextBatch(eligible func(SkyhookNode) bool) []SkyhookNode {
+	if c.Strategy != nil && c.BatchState.ShouldStop {
+		return nil
+	}
+
+	// Finish the current batch before starting a new one. Sticky nodes run alongside the
+	// InProgress ones, since IntrospectNode moves a node InProgress → Waiting between packages
+	// and it would otherwise stall until every other node went idle. While any node is
+	// InProgress they are capped at the batch size: a node that was ignored, untolerated or
+	// relabelled in keeps its NodePriority entry while another takes its slot, so entries can
+	// outnumber the budget. Once none is, every sticky node runs, uncapped.
+	inProgress, sticky := c.currentBatchNodes(eligible)
+	if len(inProgress) > 0 {
+		room := max(0, c.batchSize()-len(inProgress))
+		return append(inProgress, sticky[:min(room, len(sticky))]...)
+	}
+	if len(sticky) > 0 {
+		return sticky
+	}
+
+	return c.createNewBatch(eligible)
+}
+
+// currentBatchNodes splits the eligible nodes of the batch in flight into the InProgress ones and
+// the sticky rest.
+func (c *Compartment) currentBatchNodes(eligible func(SkyhookNode) bool) (inProgress, sticky []SkyhookNode) {
+	for _, node := range c.nodes {
+		if (eligible != nil && !eligible(node)) || !InCurrentBatch(node) {
+			continue
+		}
+		if node.Status() == v1alpha1.StatusInProgress {
+			inProgress = append(inProgress, node)
+		} else {
+			sticky = append(sticky, node)
+		}
+	}
+	return inProgress, sticky
+}
+
+// InCurrentBatch reports whether the node belongs to the batch in flight: InProgress, or picked
+// for the batch (still in NodePriority) but not yet Complete.
+func InCurrentBatch(node SkyhookNode) bool {
+	if node.Status() == v1alpha1.StatusInProgress {
+		return true
+	}
+	skyhook := node.GetSkyhook()
+	if skyhook == nil || skyhook.NodeWright == nil {
+		return false
+	}
+	_, picked := skyhook.Status.NodePriority[node.GetNode().Name]
+	return picked && !node.IsComplete()
+}
+
+// HoldsBatchSlot reports whether a current-batch member has a package stage in progress or
+// erroring. A failed attempt can still retry, so lifecycle taints must not release its slot.
+// A node picked and then displaced before any stage was dispatched keeps its NodePriority entry
+// while another node takes its slot, so membership alone is not enough.
+func HoldsBatchSlot(node SkyhookNode) bool {
+	if !InCurrentBatch(node) {
+		return false
+	}
+	state, err := node.State()
+	if err != nil {
+		return false
+	}
+	for _, status := range state {
+		if status.IsActive() {
+			return true
+		}
+	}
+	return false
+}
+
+// batchSize is how many nodes the compartment admits into one batch.
+func (c *Compartment) batchSize() int {
+	if c.Strategy != nil {
+		return c.Strategy.CalculateBatchSize(len(c.nodes), &c.BatchState)
+	}
+	return CalculateCeiling(c.Budget, len(c.nodes))
+}
+
+func (c *Compartment) createNewBatch(eligible func(SkyhookNode) bool) []SkyhookNode {
+	batchSize := c.batchSize()
+	if batchSize <= 0 {
+		return nil
+	}
+
+	selectedNodes := make([]SkyhookNode, 0)
+	// Prioritize Waiting nodes (nodes waiting for their batch) over Unknown nodes
+	// Unknown is kept for backwards compatibility and for nodes transitioning states
+	priority := []v1alpha1.Status{v1alpha1.StatusWaiting, v1alpha1.StatusUnknown, v1alpha1.StatusBlocked, v1alpha1.StatusErroring}
+
+	for _, status := range priority {
+		for _, node := range c.nodes {
+			if len(selectedNodes) >= batchSize {
+				break
+			}
+			if node.Status() != status {
+				continue
+			}
+			if !node.IsComplete() && (eligible == nil || eligible(node)) {
+				selectedNodes = append(selectedNodes, node)
+			}
+		}
+		if len(selectedNodes) >= batchSize {
+			break
+		}
+	}
+
+	return selectedNodes
+}
+
+// IsBatchComplete checks if the current batch has reached terminal states
+// A batch is complete when there are no nodes in InProgress status
+func (c *Compartment) IsBatchComplete() bool {
+	return c.getInProgressCount() == 0
+}
+
+// RebaselineBatchCheckpoints absorbs terminal-count changes attributable to
+// compartment membership churn without hiding progress from existing members.
+func (c *Compartment) RebaselineBatchCheckpoints(membershipDelta int, previousNodeStatus map[string]v1alpha1.Status) bool {
+	currentCompleted := 0
+	currentFailed := 0
+	previouslyCompleted := 0
+	previouslyFailed := 0
+	wasTerminal := func(name string, want v1alpha1.Status) bool {
+		prev, ok := previousNodeStatus[name]
+		// Missing or operator-imposed placeholder state means there is no trustworthy
+		// prior observation. Treat a terminal node as already terminal so returning
+		// members are absorbed as churn instead of counted as new batch progress.
+		if !ok || prev == v1alpha1.StatusPaused || prev == v1alpha1.StatusDisabled {
+			return true
+		}
+		return prev == want
+	}
+	for _, node := range c.nodes {
+		if node.IsComplete() {
+			currentCompleted++
+			if wasTerminal(node.GetNode().Name, v1alpha1.StatusComplete) {
+				previouslyCompleted++
+			}
+		} else if node.Status() == v1alpha1.StatusErroring {
+			currentFailed++
+			if wasTerminal(node.GetNode().Name, v1alpha1.StatusErroring) {
+				previouslyFailed++
+			}
+		}
+	}
+
+	remaining := membershipDelta
+	if remaining < 0 {
+		remaining = -remaining
+	}
+	if remaining == 0 {
+		return false
+	}
+
+	changed := false
+	absorb := func(checkpoint *int, current int, increasing bool, limit int) {
+		if remaining == 0 || limit == 0 {
+			return
+		}
+		delta := current - *checkpoint
+		if (!increasing && delta >= 0) || (increasing && delta <= 0) {
+			return
+		}
+		if delta < 0 {
+			delta = -delta
+		}
+		amount := min(remaining, delta)
+		if limit > 0 {
+			amount = min(amount, limit)
+		}
+		if increasing {
+			*checkpoint += amount
+		} else {
+			*checkpoint -= amount
+		}
+		remaining -= amount
+		changed = changed || amount > 0
+	}
+
+	if membershipDelta > 0 {
+		// Only absorb terminal states that were already terminal before this reconcile.
+		// This keeps failures that happened to existing members in the current batch.
+		completedLimit := currentCompleted - c.BatchState.CompletedNodes
+		failedLimit := currentFailed - c.BatchState.FailedNodes
+		if previousNodeStatus != nil {
+			completedLimit = max(0, previouslyCompleted-c.BatchState.CompletedNodes)
+			failedLimit = max(0, previouslyFailed-c.BatchState.FailedNodes)
+		}
+		absorb(&c.BatchState.CompletedNodes, currentCompleted, true, completedLimit)
+		absorb(&c.BatchState.FailedNodes, currentFailed, true, failedLimit)
+	} else {
+		// Removed members can only explain decreases; field-specific correction in
+		// EvaluateCurrentBatch preserves positive progress in the other outcome.
+		absorb(&c.BatchState.CompletedNodes, currentCompleted, false, remaining)
+		absorb(&c.BatchState.FailedNodes, currentFailed, false, remaining)
+	}
+	return changed
+}
+
+// EvaluateCurrentBatch evaluates the current batch result if it's complete
+// Uses delta-based tracking: compares current state to last checkpoint
+func (c *Compartment) EvaluateCurrentBatch() (bool, int, int) {
+	if !c.IsBatchComplete() {
+		return false, 0, 0 // Batch not complete yet
+	}
+
+	// If this is the first batch (nothing has been processed yet), skip evaluation
+	// The batch will be started in the next reconcile
+	if c.BatchState.CurrentBatch == 0 {
+		c.BatchState.CurrentBatch = 1
+		return false, 0, 0
+	}
+
+	// Count current state in the compartment
+	currentCompleted := 0
+	currentFailed := 0
+	currentBlocked := 0
+	for _, node := range c.nodes {
+		if node.IsComplete() {
+			currentCompleted++
+		} else if node.Status() == v1alpha1.StatusErroring {
+			currentFailed++
+		} else if node.Status() == v1alpha1.StatusBlocked {
+			currentBlocked++
+		}
+	}
+
+	// Calculate delta from last checkpoint. A count can decrease without the other
+	// count becoming invalid (for example, Erroring -> Complete recovery), so
+	// rebaseline only the field that moved backwards and preserve positive progress.
+	deltaCompleted := currentCompleted - c.BatchState.CompletedNodes
+	deltaFailed := currentFailed - c.BatchState.FailedNodes
+	corrected := false
+	if deltaCompleted < 0 {
+		c.BatchState.CompletedNodes = currentCompleted
+		deltaCompleted = 0
+		corrected = true
+	}
+	if deltaFailed < 0 {
+		c.BatchState.FailedNodes = currentFailed
+		deltaFailed = 0
+		corrected = true
+	}
+	if corrected && deltaCompleted == 0 && deltaFailed == 0 {
+		return false, 0, 0
+	}
+
+	// If batch is complete but we have blocked nodes and no completed/failed changes,
+	// we still need to advance the batch. This handles the case where all nodes in a batch
+	// become blocked (e.g., due to taints). The batch is complete (no InProgress nodes),
+	// so we should still evaluate it even though no nodes succeeded or failed.
+	// The caller will need to determine the batch size from blocked nodes.
+	if deltaCompleted == 0 && deltaFailed == 0 && currentBlocked > 0 {
+		// Batch is complete but all nodes are blocked - still advance the batch
+		// Update checkpoints
+		c.BatchState.CompletedNodes = currentCompleted
+		c.BatchState.FailedNodes = currentFailed
+		// Return true to indicate batch is complete, but 0 successes and 0 failures
+		// The caller will use blocked node count to determine batch size
+		return true, 0, 0
+	}
+
+	// Only evaluate if there's actually a change (batch was processed)
+	if deltaCompleted == 0 && deltaFailed == 0 {
+		return false, 0, 0
+	}
+
+	// Update checkpoints
+	c.BatchState.CompletedNodes = currentCompleted
+	c.BatchState.FailedNodes = currentFailed
+
+	return true, deltaCompleted, deltaFailed
+}
+
+// EvaluateAndUpdateBatchState evaluates a completed batch and updates the persistent state
+func (c *Compartment) EvaluateAndUpdateBatchState(batchSize int, successCount int, failureCount int) {
+	if c.Strategy != nil {
+		// Use strategy-specific evaluation
+		c.Strategy.EvaluateBatchResult(&c.BatchState, batchSize, successCount, failureCount, len(c.nodes))
+	} else {
+		// No strategy: just update basic counters
+		c.BatchState.CurrentBatch++
+		c.BatchState.LastBatchSize = batchSize
+	}
+}
+
+// GetBatchState returns the current batch processing state
+func (c *Compartment) GetBatchState() v1alpha1.BatchProcessingState {
+	return c.BatchState
+}
+
+// strategySafetyOrder defines the safety ordering of strategies
+// Lower values indicate safer strategies (less aggressive rollout)
+// Strategy safety order: Fixed (0) > Linear (1) > Exponential (2)
+var strategySafetyOrder = map[v1alpha1.StrategyType]int{
+	v1alpha1.StrategyTypeFixed:       0,
+	v1alpha1.StrategyTypeLinear:      1,
+	v1alpha1.StrategyTypeExponential: 2,
+	v1alpha1.StrategyTypeUnknown:     999, // Unknown is least safe
+}
+
+// GetStrategyType returns the strategy type for a compartment
+func GetStrategyType(strategy *v1alpha1.DeploymentStrategy) v1alpha1.StrategyType {
+	if strategy == nil {
+		return v1alpha1.StrategyTypeUnknown
+	}
+	if strategy.Fixed != nil {
+		return v1alpha1.StrategyTypeFixed
+	}
+	if strategy.Linear != nil {
+		return v1alpha1.StrategyTypeLinear
+	}
+	if strategy.Exponential != nil {
+		return v1alpha1.StrategyTypeExponential
+	}
+	return v1alpha1.StrategyTypeUnknown
+}
+
+// StrategyIsSafer returns true if strategy a is safer than strategy b
+// Strategy safety order: Fixed > Linear > Exponential
+func StrategyIsSafer(a, b v1alpha1.StrategyType) bool {
+	return strategySafetyOrder[a] < strategySafetyOrder[b]
+}

@@ -1,0 +1,24 @@
+{{- if eq .Release.Namespace "default" }}
+{{- fail "Deployment to 'default' namespace is not allowed for security reasons. Please specify a different namespace." }}
+{{- end }}
+
+
+{{- /* Prevent conflicting node selection config */ -}}
+{{- if and .Values.controllerManager.selectors .Values.controllerManager.nodeAffinity.matchExpressions }}
+{{- fail "Error: Cannot specify both controllerManager.selectors and controllerManager.nodeAffinity.matchExpressions. Use nodeAffinity.matchExpressions for complex node selection or selectors for simple key-value matching." }}
+{{- end }}
+
+{{- /* Validate PodDisruptionBudget: minAvailable must be < replicas */ -}}
+{{- /* Skip comparison only for percentage strings (e.g. "50%") — Kubernetes accepts them   */ -}}
+{{- /* but they cannot be meaningfully compared to an integer replica count at render time.  */ -}}
+{{- /* Numeric strings (--set-string minAvailable=2) are still coerced and compared.        */ -}}
+{{- if ((.Values.controllerManager.podDisruptionBudget).minAvailable) -}}
+  {{- $minAvail := .Values.controllerManager.podDisruptionBudget.minAvailable -}}
+  {{- if not (and (kindIs "string" $minAvail) (hasSuffix "%" $minAvail)) -}}
+    {{- if ge (int $minAvail) (int .Values.controllerManager.replicas) -}}
+      {{- fail "Error: controllerManager.podDisruptionBudget.minAvailable must be less than controllerManager.replicas" -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+
+

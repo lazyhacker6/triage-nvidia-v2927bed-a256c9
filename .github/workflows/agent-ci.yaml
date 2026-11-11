@@ -1,0 +1,718 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Agent CI
+on:
+  # Pull requests run this from merge-gate.yaml, whose `agent` path filter
+  # mirrors the push paths below, plus merge-gate.yaml itself.
+  workflow_call: {}
+  push:
+    branches:
+      - main
+    tags:
+      - agent/*
+    paths:
+      - agent/**
+      - containers/agent.Dockerfile
+      - k8s-tests/operator-agent/**
+      - .github/actions/**
+      - operator/versions.yaml
+      - operator/versions.sh
+      - scripts/latest-distroless.sh
+      - .github/workflows/agent-ci.yaml
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  DEBIAN_VERSION: trixie
+  PUSH_TO_REGISTRY: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+  # Opt all JS actions into Node 24 ahead of GitHub's Node 20 phase-out.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  fetch-distroless-versions:
+    name: Resolve Distroless Base Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      distroless-version: ${{ steps.fetch.outputs.distroless-version }}
+      distroless-digest: ${{ steps.fetch.outputs.distroless-digest }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-oras
+      - name: Resolve newest published distroless/static
+        id: fetch
+        run: |
+          ./scripts/latest-distroless.sh \
+            --repo nvcr.io/nvidia/distroless/static \
+            --major 4 \
+            --print | tee -a "$GITHUB_OUTPUT"
+
+  compute-metadata:
+    name: Compute Image Metadata
+    runs-on: ubuntu-latest
+    outputs:
+      git-sha: ${{ steps.meta.outputs.git-sha }}
+      agent-version: ${{ steps.meta.outputs.agent-version }}
+      agent-image-tag: ${{ steps.meta.outputs.agent-image-tag }}
+      tags: ${{ steps.meta.outputs.tags }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Fetch all tags
+        run: git fetch --tags --force
+      - name: Compute metadata
+        id: meta
+        run: |
+          GIT_SHA=$(git rev-parse --short ${{ github.sha }})
+          echo "git-sha=${GIT_SHA}" >> "$GITHUB_OUTPUT"
+
+          case ${{ github.ref_type }} in
+            branch)
+              # The last release tag plus the current git sha
+              AGENT_VERSION=$(git tag --list 'agent/*' --sort=-v:refname | head -n 1 | cut -d/ -f2)+${GIT_SHA}
+              # Convert + to - for docker tag compliance
+              AGENT_IMAGE_TAG=$(echo "${AGENT_VERSION}" | tr + -)
+              TAGS="${GIT_SHA} ${AGENT_IMAGE_TAG}"
+              ;;
+            tag)
+              # The version part of the tag. latest is not in this list: the
+              # create-manifest job moves it only for the newest stable release.
+              AGENT_VERSION=$(echo "${{ github.ref_name }}" | cut -f 2 -d /)
+              AGENT_IMAGE_TAG="${AGENT_VERSION}"
+              TAGS="${GIT_SHA} ${AGENT_VERSION}"
+              ;;
+            *)
+              echo "Unknown ref type ${{ github.ref_type }}"
+              exit 1
+              ;;
+          esac
+
+          echo "agent-version=${AGENT_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "agent-image-tag=${AGENT_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "📦 Agent Version: ${AGENT_VERSION}"
+          echo "🏷️  Image Tag: ${AGENT_IMAGE_TAG}"
+          echo "🏷️  All Tags: ${TAGS}"
+
+  test:
+    name: Agent Unit Tests
+    runs-on: ubuntu-latest
+    container:
+      # Named on the mirror directly: the runner pulls a job container before
+      # any step runs, so the Docker Hub mirror action cannot cover it, and an
+      # anonymous Docker Hub pull here hits the shared per-IP rate limit.
+      image: mirror.gcr.io/library/ubuntu:latest
+    steps:
+      - name: Install test dependencies
+        run: |
+          apt-get update
+          apt-get install --yes --no-install-recommends ca-certificates make
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: agent/go.mod
+          cache-dependency-path: agent/go.sum
+      - name: Run tests with coverage
+        working-directory: agent
+        run: CGO_ENABLED=0 make test
+      - name: Upload coverage artifact
+        if: hashFiles('agent/reporting/cover.out') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: coverage-agent-unit-tests
+          path: agent/reporting/cover.out
+          retention-days: 1
+          if-no-files-found: ignore
+
+  lint:
+    name: Agent Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: agent/go.mod
+          cache-dependency-path: agent/go.sum
+      # make lint installs the golangci-lint pinned in agent/deps.mk and runs the
+      # license-header check, so CI and a local `make test lint` use the same
+      # linter version and report the same findings.
+      - name: Lint
+        working-directory: agent
+        run: make lint
+
+  build-agent:
+    name: Build Agent (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    needs: [test, lint, compute-metadata, fetch-distroless-versions]
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Log in to the Container registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Route Docker Hub pulls through mirror.gcr.io
+        id: docker-hub-mirror
+        uses: ./.github/actions/setup-docker-hub-mirror
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
+        with:
+          driver-opts: ${{ steps.docker-hub-mirror.outputs.buildx-driver-opts }}
+          buildkitd-config: ${{ steps.docker-hub-mirror.outputs.buildkitd-config }}
+      - name: Build and smoke-test the agent container image
+        env:
+          GIT_SHA: ${{ needs.compute-metadata.outputs.git-sha }}
+          AGENT_VERSION: ${{ needs.compute-metadata.outputs.agent-version }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          cd agent
+          GO_VERSION=$(awk '/^go /{go=$2} /^toolchain /{tc=$2; sub(/^go/,"",tc)} END{print (tc!=""?tc:go)}' go.mod)
+          IMAGE="nodewright-agent:${GIT_SHA}"
+
+          set -x
+          # Built with --load rather than pushed directly: the --version smoke
+          # test below needs the image present locally, and buildx rejects --load
+          # together with --push. The platform tags are pushed afterwards.
+          docker buildx build \
+            --build-arg GIT_SHA=${GIT_SHA} \
+            --build-arg AGENT_VERSION=${AGENT_VERSION} \
+            --build-arg GO_VERSION="${GO_VERSION}" \
+            --build-arg DEBIAN_VERSION=${{ env.DEBIAN_VERSION }} \
+            --build-arg DISTROLESS_VERSION=${{ needs.fetch-distroless-versions.outputs.distroless-version }} \
+            --build-arg DISTROLESS_DIGEST_SUFFIX="@${{ needs.fetch-distroless-versions.outputs.distroless-digest }}" \
+            --load \
+            --platform "$PLATFORM" \
+            --provenance=false \
+            --tag "$IMAGE" \
+            -f ../containers/agent.Dockerfile .
+
+          VERSION_OUTPUT=$(docker run --rm --platform "$PLATFORM" "$IMAGE" --version)
+          if [ "$VERSION_OUTPUT" != "$AGENT_VERSION" ]; then
+            echo "Expected agent version ${AGENT_VERSION}, got ${VERSION_OUTPUT}"
+            exit 1
+          fi
+
+      - name: Push platform tags
+        env:
+          GIT_SHA: ${{ needs.compute-metadata.outputs.git-sha }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          if [ "${PUSH_TO_REGISTRY}" != "true" ]; then
+            echo "Fork PR build: image built and smoke-tested without pushing to registry"
+            exit 0
+          fi
+
+          PLATFORM_TAG=$(echo "$PLATFORM" | tr '/' '-')
+          IMAGE_NAME=$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          REGISTRY=$(echo "${{ env.REGISTRY }}" | tr '[:upper:]' '[:lower:]')
+
+          set -x
+          for TAG in ${{ needs.compute-metadata.outputs.tags }}; do
+            FULL_TAG="${REGISTRY}/${IMAGE_NAME}/agent:${TAG}-${PLATFORM_TAG}"
+            docker tag "nodewright-agent:${GIT_SHA}" "${FULL_TAG}"
+            docker push "${FULL_TAG}"
+          done
+
+  # Create multi-platform manifest from individual architecture builds
+  # Release gate: a tag build stops here, before the version tag exists, if either
+  # platform image has a fixable critical or high finding that .openvex.json does
+  # not suppress. Only the per-platform tags are pushed by then, so a blocked
+  # release leaves nothing signed, no version tag and no latest. RC tags are gated
+  # too: that is when there is still time to fix a finding before the stable tag.
+  # Not listed in agent-gate: it is skipped on every event but a tag, and a failure
+  # still reaches agent-gate through create-manifest, which it stops.
+  vuln-gate:
+    name: Vulnerability gate (${{ matrix.platform }})
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    needs: [compute-metadata, build-agent]
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Name the platform image
+        id: image
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          VERSION: ${{ needs.compute-metadata.outputs.agent-version }}
+        run: echo "ref=${REGISTRY}/${IMAGE_NAME}/agent:${VERSION}-${PLATFORM//\//-}" >> "$GITHUB_OUTPUT"
+
+      - name: Scan the agent image
+        uses: ./.github/actions/vuln-gate
+        with:
+          image: ${{ steps.image.outputs.ref }}
+          platform: ${{ matrix.platform }}
+
+  # Waits for vuln-gate, which runs only on tags; !cancelled() lets it run when
+  # the gate was skipped, and the result check still stops it when the gate failed.
+  create-manifest:
+    if: >-
+      !cancelled()
+      && needs.build-agent.result == 'success'
+      && (needs.vuln-gate.result == 'success' || needs.vuln-gate.result == 'skipped')
+      && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    name: Create Agent Manifest
+    runs-on: ubuntu-latest
+    needs: [compute-metadata, build-agent, vuln-gate]
+    # Serialize main runs, and only those: the ancestry check and the write of
+    # :main are separate registry calls, so two overlapping main builds could
+    # both pass the check and the older one write last. Every other run gets a
+    # group of its own so tag releases never wait. queue: max because the
+    # default keeps one pending run and cancels the one it replaces, which would
+    # drop that commit's index.
+    concurrency:
+      group: ${{ github.ref == 'refs/heads/main' && format('{0}-main-tag', github.workflow) || format('{0}-manifest-{1}', github.workflow, github.run_id) }}
+      cancel-in-progress: false
+      queue: max
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+      subject-name: ${{ steps.manifest.outputs.subject-name }}
+      platform-digests: ${{ steps.attest.outputs.platform-digests }}
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Route Docker Hub pulls through mirror.gcr.io
+        id: docker-hub-mirror
+        uses: ./.github/actions/setup-docker-hub-mirror
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
+        with:
+          driver-opts: ${{ steps.docker-hub-mirror.outputs.buildx-driver-opts }}
+          buildkitd-config: ${{ steps.docker-hub-mirror.outputs.buildkitd-config }}
+
+      - name: Create manifests
+        id: manifest
+        run: |
+          IMAGE_NAME=$(echo "${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          REGISTRY=$(echo "${{ env.REGISTRY }}" | tr '[:upper:]' '[:lower:]')
+
+          for TAG in ${{ needs.compute-metadata.outputs.tags }}; do
+            FULL_TAG="${REGISTRY}/${IMAGE_NAME}/agent:${TAG}"
+            echo "📦 Creating manifest for $FULL_TAG"
+            docker manifest create $FULL_TAG \
+              ${FULL_TAG}-linux-amd64 \
+              ${FULL_TAG}-linux-arm64
+            docker manifest push $FULL_TAG
+            echo "✅ Pushed $FULL_TAG"
+          done
+
+          echo "subject-name=${REGISTRY}/${IMAGE_NAME}/agent" >> "$GITHUB_OUTPUT"
+          # Platform-specific tags (e.g. v7.0.0-linux-amd64) are left in the
+          # registry as intermediate artifacts; users pull the manifest tags.
+          echo "✅ Multi-platform manifests created successfully"
+
+      # latest tracks the newest stable release, so an RC or a patch on an older release line
+      # leaves it alone. Checked here, just before the push, rather than in compute-metadata:
+      # a re-run or slow run for an older tag would otherwise overwrite a newer release.
+      - name: Move latest to the newest stable release
+        if: github.ref_type == 'tag'
+        run: |
+          git fetch --tags --force
+          NEWEST_STABLE=$(git tag --list 'agent/v*' --sort=-v:refname | grep -E '^agent/v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+          if [ "${GITHUB_REF_NAME}" != "${NEWEST_STABLE}" ]; then
+            echo "Leaving latest alone: ${GITHUB_REF_NAME} is not the newest stable release (${NEWEST_STABLE})"
+            exit 0
+          fi
+          IMAGE="${{ steps.manifest.outputs.subject-name }}"
+          docker buildx imagetools create --tag "${IMAGE}:latest" "${IMAGE}:${{ needs.compute-metadata.outputs.agent-version }}"
+          echo "✅ Pushed ${IMAGE}:latest"
+
+      # main tracks the newest image built from main, which the scheduled
+      # vulnerability scan reads to answer "does main have findings". The push is
+      # path-filtered, so the newest image is often not main's HEAD; "newest" is by
+      # ancestry instead, read from the revision label on the image main points at,
+      # so a slow or re-run build of an older commit cannot move it back.
+      - name: Move main to the newest main build
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ steps.manifest.outputs.subject-name }}
+          SHORT_SHA: ${{ needs.compute-metadata.outputs.git-sha }}
+        run: |
+          set -euo pipefail
+          # Only a missing tag means there is nothing to compare against. Any other
+          # inspect failure (a registry error, say) fails the step rather than
+          # moving main without the ancestry check; a re-run moves it.
+          current=""
+          inspect_err="${RUNNER_TEMP}/main-inspect.err"
+          if image_json="$(docker buildx imagetools inspect "${IMAGE}:main" --format '{{json .Image}}' 2> "${inspect_err}")"; then
+            current="$(jq -r '.["linux/amd64"].config.Labels["org.opencontainers.image.revision"] // empty' <<< "${image_json}")"
+          elif ! grep -q ': not found' "${inspect_err}"; then
+            cat "${inspect_err}" >&2
+            echo "::error::Could not read ${IMAGE}:main, so cannot tell whether ${GITHUB_SHA} is newer than what it carries."
+            exit 1
+          fi
+          if [ -n "${current}" ]; then
+            status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${current}...${GITHUB_SHA}" --jq .status)"
+            case "${status}" in
+              ahead | identical) ;;
+              *)
+                echo "Leaving main alone: it carries ${current}, and ${GITHUB_SHA} is ${status} of it"
+                exit 0
+                ;;
+            esac
+          fi
+          docker buildx imagetools create --tag "${IMAGE}:main" "${IMAGE}:${SHORT_SHA}"
+          echo "✅ Pushed ${IMAGE}:main"
+
+      - name: Resolve multi-platform manifest digest
+        id: digest
+        uses: ./.github/actions/resolve-oci-digest
+        with:
+          image: ${{ steps.manifest.outputs.subject-name }}
+          tag: ${{ needs.compute-metadata.outputs.git-sha }}
+
+      - name: Sign GHCR agent image and attach SBOM
+        id: attest
+        if: env.PUSH_TO_REGISTRY == 'true' && startsWith(github.ref, 'refs/tags/agent/')
+        uses: ./.github/actions/cosign-attest-multiplatform
+        with:
+          subject-name: ${{ steps.manifest.outputs.subject-name }}
+          index-digest: ${{ steps.digest.outputs.digest }}
+
+      - name: Attest GHCR agent provenance
+        if: env.PUSH_TO_REGISTRY == 'true' && startsWith(github.ref, 'refs/tags/agent/')
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name: ${{ steps.manifest.outputs.subject-name }}
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify GHCR agent signature and attestations
+        if: env.PUSH_TO_REGISTRY == 'true' && startsWith(github.ref, 'refs/tags/agent/')
+        uses: ./.github/actions/cosign-verify-release
+        with:
+          subject-name: ${{ steps.manifest.outputs.subject-name }}
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          platform-digests: ${{ steps.attest.outputs.platform-digests }}
+          certificate-identity-regexp: ^https://github.com/${{ github.repository }}/\.github/workflows/agent-ci\.yaml@refs/tags/agent/.*$
+
+  # Copies the released index to NGC staging, from where NVIDIA's internal release
+  # process promotes it to nvcr.io/nvidia. It is copied by digest rather than
+  # rebuilt so both registries serve the same bytes and the chart's digest pins
+  # hold for either. `oras cp -r` brings the signature and attestations along
+  # rather than signing again, so NGC carries the evidence GHCR does and this job
+  # holds no signing identity. A separate job so only a release tag ever enters
+  # the ngc-publish environment that holds NGC_API_KEY, and so an NGC failure can
+  # be re-run without republishing to GHCR.
+  publish-ngc:
+    if: startsWith(github.ref, 'refs/tags/agent/')
+    name: Publish Agent to NGC
+    runs-on: ubuntu-latest
+    # Gated on the integration suite, as the operator's NGC copy is gated on its
+    # test matrix: an agent that fails the operator contract is not staged.
+    needs: [compute-metadata, create-manifest, operator-agent-tests]
+    environment: ngc-publish
+    env:
+      NGC_IMAGE: nvcr.io/1070195845945670/nodewright/agent
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to NGC
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: nvcr.io
+          username: $oauthtoken
+          password: ${{ secrets.NGC_API_KEY }}
+
+      - name: Set up oras
+        uses: ./.github/actions/setup-oras
+
+      # -r follows the referrers of every manifest in the graph, not only the
+      # index: the SBOM and VEX attestations hang on the platform manifests and
+      # would otherwise be left behind on GHCR.
+      - name: Copy the release index and its evidence to NGC
+        env:
+          SOURCE: ${{ needs.create-manifest.outputs.subject-name }}@${{ needs.create-manifest.outputs.digest }}
+          TAGS: ${{ needs.compute-metadata.outputs.tags }}
+        run: |
+          set -euo pipefail
+          oras cp -r "${SOURCE}" "${NGC_IMAGE}:${TAGS// /,}"
+          echo "✅ Copied ${SOURCE} to ${NGC_IMAGE}:${TAGS}"
+
+      - name: Resolve multi-platform manifest digest
+        id: digest
+        uses: ./.github/actions/resolve-oci-digest
+        with:
+          image: ${{ env.NGC_IMAGE }}
+          tag: ${{ needs.compute-metadata.outputs.git-sha }}
+
+      - name: Check the NGC index matches GHCR
+        env:
+          GHCR_DIGEST: ${{ needs.create-manifest.outputs.digest }}
+          NGC_DIGEST: ${{ steps.digest.outputs.digest }}
+        run: |
+          if [ "${NGC_DIGEST}" != "${GHCR_DIGEST}" ]; then
+            echo "::error::NGC index ${NGC_DIGEST} is not the GHCR index ${GHCR_DIGEST}"
+            exit 1
+          fi
+
+      # The platform digests come from the GHCR job's attest step. They hold for
+      # NGC because the index digest check above proves the copy is byte-identical,
+      # children included.
+      - name: Verify NGC agent signature and attestations
+        uses: ./.github/actions/cosign-verify-release
+        with:
+          subject-name: ${{ env.NGC_IMAGE }}
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          platform-digests: ${{ needs.create-manifest.outputs.platform-digests }}
+          certificate-identity-regexp: ^https://github.com/${{ github.repository }}/\.github/workflows/agent-ci\.yaml@refs/tags/agent/.*$
+          # After vex-reattest.yaml replaces this release's OpenVEX attestation, the
+          # only one left is signed by that workflow on this component's release
+          # branch, so a re-run of this job must accept it for OpenVEX.
+          openvex-identity-regexp: ^https://github.com/${{ github.repository }}/\.github/workflows/(agent-ci\.yaml@refs/tags/agent/.*|vex-reattest\.yaml@refs/heads/release/agent/v[0-9]+\.[0-9]+\.x)$
+
+  # The operator-side contract suite (k8s-tests/operator-agent/) against the
+  # image this run just built. operator-ci.yaml runs the same scenarios against
+  # the released agent pinned in chart/values.yaml; the scenarios are shared,
+  # never forked.
+  #
+  # !cancelled() and the explicit result check, rather than the default
+  # success(): vuln-gate sits upstream through create-manifest and is skipped on
+  # every event but a tag, and the default treats a skipped ancestor as a reason
+  # to skip this job too.
+  operator-agent-tests:
+    if: >-
+      !cancelled()
+      && needs.create-manifest.result == 'success'
+      && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    name: Operator Agent Integration Tests
+    runs-on: ubuntu-latest
+    needs: [compute-metadata, create-manifest]
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-tags: true
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: operator/go.mod
+          cache-dependency-path: operator/go.sum
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Load Kubernetes test versions
+        id: k8s-versions
+        run: |
+          cd operator
+          make yq
+          YQ="$PWD/bin/yq" ./versions.sh --print >> "$GITHUB_OUTPUT"
+
+      - name: Route Docker Hub pulls through mirror.gcr.io
+        uses: ./.github/actions/setup-docker-hub-mirror
+        with:
+          images: kindest/node:v${{ steps.k8s-versions.outputs.kind-nodeimage }}
+
+      - name: Validate KinD node image
+        env:
+          K8S_VERSION: ${{ steps.k8s-versions.outputs.kind-nodeimage }}
+        run: |
+          cd operator
+          make validate-kind-node-image KIND_NODE_IMAGE_VERSION="$K8S_VERSION"
+
+      # ubuntu-26.04 runners boot with the kernel's inotify defaults (128 instances)
+      # because the image's /etc/sysctl.conf is no longer applied
+      # (actions/runner-images#15108), and every kind node runs systemd. Drop this
+      # once the runner image applies the limits again.
+      - name: Restore inotify limits
+        run: sudo sysctl -w fs.inotify.max_user_instances=1280 fs.inotify.max_user_watches=655360
+
+      - name: Create Kubernetes KinD Cluster
+        uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa  # v1.15.1
+        with:
+          version: ${{ steps.k8s-versions.outputs.kind-binary }}
+          node_image: kindest/node:v${{ steps.k8s-versions.outputs.kind-nodeimage }}
+          config: operator/config/local-dev/kind-config.yaml
+          cluster_name: kind
+
+      - name: Restore cached Binaries
+        id: cached-binaries
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          key: ${{ runner.os }}-${{ runner.arch }}-bin-${{ hashFiles('operator/go.mod', 'operator/deps.mk', 'operator/versions.yaml', 'operator/versions.sh') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-bin-
+          path: |
+            ${{ github.workspace }}/operator/bin
+            ~/.cache/go-build
+
+      - name: Install dependencies
+        if: steps.cached-binaries.outputs.cache-hit != 'true'
+        run: |
+          cd operator
+          make install-deps
+
+      - name: Save cached Binaries
+        if: steps.cached-binaries.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          key: ${{ runner.os }}-${{ runner.arch }}-bin-${{ hashFiles('operator/go.mod', 'operator/deps.mk', 'operator/versions.yaml', 'operator/versions.sh') }}
+          path: |
+            ${{ github.workspace }}/operator/bin
+            ~/.cache/go-build
+
+      - name: Run operator-agent tests
+        env:
+          AGENT_IMAGE: ${{ format('{0}/{1}/agent:{2}', env.REGISTRY, github.repository, needs.compute-metadata.outputs.agent-image-tag) }}
+        run: |
+          cd operator
+          export AGENT_IMAGE="${AGENT_IMAGE,,}"
+          echo "Testing with agent image: ${AGENT_IMAGE}"
+          make build-cli
+          make setup-kind-cluster operator-agent-tests
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        uses: ./.github/actions/dump-operator-agent-diagnostics
+
+  # merge-gate.yaml already fails on any failed job in this workflow, but a
+  # skipped job does not fail it, and operator-agent-tests is the whole point of
+  # the workflow. Both registry-dependent jobs are therefore asserted in both
+  # directions: required to succeed when they can run, required to be skipped
+  # when they cannot, so a run that should have happened and silently did not
+  # also fails.
+  agent-gate:
+    name: agent-gate
+    needs:
+      - fetch-distroless-versions
+      - compute-metadata
+      - test
+      - lint
+      - build-agent
+      - create-manifest
+      - operator-agent-tests
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all required jobs passed
+        env:
+          # Passed through the environment rather than interpolated into the jq
+          # program: a needs result is a fixed enum, but keeping the payload out
+          # of the script text avoids building a program from workflow context.
+          # PUSH_TO_REGISTRY is already a workflow-level env var.
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "$RESULTS"
+
+          # Jobs with no `if:` run on every event, including fork PRs.
+          echo "$RESULTS" | jq -e '
+            to_entries
+            | map(select(.key != "create-manifest" and .key != "operator-agent-tests"))
+            | all(.value.result == "success")'
+
+          # create-manifest and operator-agent-tests need GHCR write, so they
+          # skip on fork PRs. Asserting the expected state in both directions
+          # keeps a skip from hiding a run that should have happened.
+          if [ "$PUSH_TO_REGISTRY" = "true" ]; then
+            echo "$RESULTS" | jq -e '
+              to_entries
+              | map(select(.key == "create-manifest" or .key == "operator-agent-tests"))
+              | all(.value.result == "success")'
+          else
+            echo "$RESULTS" | jq -e '
+              to_entries
+              | map(select(.key == "create-manifest" or .key == "operator-agent-tests"))
+              | all(.value.result == "skipped")'
+          fi

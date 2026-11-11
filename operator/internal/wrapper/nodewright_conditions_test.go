@@ -1,0 +1,364 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package wrapper
+
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/NVIDIA/nodewright/operator/api/nodewright/v1alpha1"
+	"github.com/NVIDIA/nodewright/operator/internal/drain"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+var _ = Describe("Skyhook condition helpers", func() {
+	DescribeTable("skyhookConditionsEqual", func(mutate func(*metav1.Condition), expected bool) {
+		left := metav1.Condition{
+			Type:               SkyhookConditionReady,
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: 7,
+			LastTransitionTime: metav1.NewTime(time.Unix(123, 0)),
+			Reason:             "NodesConverged",
+			Message:            "All nodes converged",
+		}
+		right := left
+		if mutate != nil {
+			mutate(&right)
+		}
+
+		Expect(skyhookConditionsEqual(left, right)).To(Equal(expected))
+	},
+		Entry("returns true for identical conditions", nil, true),
+		Entry("returns false when type differs", func(condition *metav1.Condition) {
+			condition.Type = SkyhookConditionNodesIgnored
+		}, false),
+		Entry("returns false when status differs", func(condition *metav1.Condition) {
+			condition.Status = metav1.ConditionFalse
+		}, false),
+		Entry("returns false when observed generation differs", func(condition *metav1.Condition) {
+			condition.ObservedGeneration = 8
+		}, false),
+		Entry("returns false when transition time differs", func(condition *metav1.Condition) {
+			condition.LastTransitionTime = metav1.NewTime(time.Unix(456, 0))
+		}, false),
+		Entry("returns false when reason differs", func(condition *metav1.Condition) {
+			condition.Reason = "Progressing"
+		}, false),
+		Entry("returns false when message differs", func(condition *metav1.Condition) {
+			condition.Message = "Still converging"
+		}, false),
+	)
+
+	DescribeTable("conditionWithStableTransitionTime", func(lastTransitionTime metav1.Time, assertTransitionTime func(updated metav1.Condition, existingTime metav1.Time)) {
+		existingTime := metav1.NewTime(time.Unix(789, 0))
+		updated := conditionWithStableTransitionTime([]metav1.Condition{
+			{
+				Type:               SkyhookConditionReady,
+				Status:             metav1.ConditionFalse,
+				LastTransitionTime: existingTime,
+			},
+		}, metav1.Condition{
+			Type:               SkyhookConditionReady,
+			Status:             metav1.ConditionTrue,
+			LastTransitionTime: lastTransitionTime,
+		})
+
+		assertTransitionTime(updated, existingTime)
+	},
+		Entry("keeps the provided transition time when status changes", metav1.NewTime(time.Unix(999, 0)), func(updated metav1.Condition, existingTime metav1.Time) {
+			Expect(updated.LastTransitionTime).To(Equal(metav1.NewTime(time.Unix(999, 0))))
+			Expect(updated.LastTransitionTime).NotTo(Equal(existingTime))
+		}),
+		Entry("sets a fresh transition time when status changes and none is provided", metav1.Time{}, func(updated metav1.Condition, existingTime metav1.Time) {
+			Expect(updated.LastTransitionTime.IsZero()).To(BeFalse())
+			Expect(updated.LastTransitionTime).NotTo(Equal(existingTime))
+		}),
+	)
+
+	DescribeTable("conditionWithStableTransitionTimeForReasonOrMessage", func(existing metav1.Condition, incoming metav1.Condition, shouldKeepExistingTime bool) {
+		updated := conditionWithStableTransitionTimeForReasonOrMessage([]metav1.Condition{existing}, incoming)
+
+		if shouldKeepExistingTime {
+			Expect(updated.LastTransitionTime).To(Equal(existing.LastTransitionTime))
+		} else {
+			Expect(updated.LastTransitionTime).NotTo(Equal(existing.LastTransitionTime))
+			Expect(updated.LastTransitionTime.IsZero()).To(BeFalse())
+		}
+	},
+		Entry("keeps transition time when type status reason and message match",
+			metav1.Condition{
+				Type:               LegacySkyhookConditionTransition,
+				Status:             metav1.ConditionFalse,
+				LastTransitionTime: metav1.NewTime(time.Unix(789, 0)),
+				Reason:             "waiting",
+				Message:            "Transitioned [unknown] -> [waiting]",
+			},
+			metav1.Condition{
+				Type:    LegacySkyhookConditionTransition,
+				Status:  metav1.ConditionFalse,
+				Reason:  "waiting",
+				Message: "Transitioned [unknown] -> [waiting]",
+			},
+			true,
+		),
+		Entry("refreshes transition time when reason changes",
+			metav1.Condition{
+				Type:               LegacySkyhookConditionTransition,
+				Status:             metav1.ConditionFalse,
+				LastTransitionTime: metav1.NewTime(time.Unix(789, 0)),
+				Reason:             "waiting",
+				Message:            "Transitioned [unknown] -> [waiting]",
+			},
+			metav1.Condition{
+				Type:    LegacySkyhookConditionTransition,
+				Status:  metav1.ConditionFalse,
+				Reason:  "blocked",
+				Message: "Transitioned [unknown] -> [blocked]",
+			},
+			false,
+		),
+	)
+
+	Describe("AddSkyhookCondition", func() {
+		It("sets Updated only when a condition is added or changed", func() {
+			transitionTime := metav1.NewTime(time.Unix(123, 0))
+			condition := metav1.Condition{
+				Type:               SkyhookConditionReady,
+				Status:             metav1.ConditionTrue,
+				ObservedGeneration: 7,
+				LastTransitionTime: transitionTime,
+				Reason:             "NodesConverged",
+				Message:            "1/1 nodes complete (node-a)",
+			}
+			skyhook := &Skyhook{
+				NodeWright: &v1alpha1.NodeWright{},
+			}
+
+			Expect(AddSkyhookCondition(skyhook, condition)).To(BeTrue())
+			Expect(skyhook.Updated).To(BeTrue())
+
+			skyhook.Updated = false
+			Expect(AddSkyhookCondition(skyhook, condition)).To(BeFalse())
+			Expect(skyhook.Updated).To(BeFalse())
+
+			condition.Message = "1/2 nodes complete (node-a), 1 waiting (node-b)"
+			Expect(AddSkyhookCondition(skyhook, condition)).To(BeTrue())
+			Expect(skyhook.Updated).To(BeTrue())
+		})
+	})
+
+	DescribeTable("removeSkyhookConditionTypes", func(existing []metav1.Condition, conditionTypes []string, expectedTypes []string, changed bool) {
+		skyhook := &Skyhook{
+			NodeWright: &v1alpha1.NodeWright{
+				Status: v1alpha1.NodeWrightStatus{
+					Conditions: existing,
+				},
+			},
+		}
+
+		Expect(RemoveSkyhookConditionTypes(skyhook, conditionTypes...)).To(Equal(changed))
+
+		actualTypes := make([]string, 0, len(skyhook.Status.Conditions))
+		for _, condition := range skyhook.Status.Conditions {
+			actualTypes = append(actualTypes, condition.Type)
+		}
+		Expect(actualTypes).To(Equal(expectedTypes))
+		Expect(skyhook.Updated).To(Equal(changed))
+	},
+		Entry("returns false when there are no conditions", nil, []string{SkyhookConditionReady}, []string{}, false),
+		Entry("returns false when no condition types match", []metav1.Condition{
+			{Type: SkyhookConditionReady},
+		}, []string{SkyhookConditionNodesIgnored}, []string{SkyhookConditionReady}, false),
+		Entry("removes multiple matching condition types", []metav1.Condition{
+			{Type: SkyhookConditionReady},
+			{Type: SkyhookConditionNodesIgnored},
+			{Type: SkyhookConditionApplyPackage},
+			{Type: SkyhookConditionTaintNotTolerable},
+		}, []string{SkyhookConditionNodesIgnored, SkyhookConditionApplyPackage}, []string{SkyhookConditionReady, SkyhookConditionTaintNotTolerable}, true),
+	)
+
+	DescribeTable("removeSkyhookConditionTypeAndReason", func(existing []metav1.Condition, conditionType, reason string, expectedConditions []metav1.Condition, changed bool) {
+		skyhook := &Skyhook{
+			NodeWright: &v1alpha1.NodeWright{
+				Status: v1alpha1.NodeWrightStatus{
+					Conditions: existing,
+				},
+			},
+		}
+
+		Expect(RemoveSkyhookConditionTypeAndReason(skyhook, conditionType, reason)).To(Equal(changed))
+		if expectedConditions == nil {
+			Expect(skyhook.Status.Conditions).To(BeEmpty())
+		} else {
+			Expect(skyhook.Status.Conditions).To(Equal(expectedConditions))
+		}
+		Expect(skyhook.Updated).To(Equal(changed))
+	},
+		Entry("returns false when there are no conditions", nil, SkyhookConditionBlocked, SkyhookReasonNonInterruptPodsRunning, nil, false),
+		Entry("removes condition when type and reason match", []metav1.Condition{
+			{Type: SkyhookConditionBlocked, Reason: SkyhookReasonNonInterruptPodsRunning},
+			{Type: SkyhookConditionReady, Reason: "NodesConverged"},
+		}, SkyhookConditionBlocked, SkyhookReasonNonInterruptPodsRunning, []metav1.Condition{
+			{Type: SkyhookConditionReady, Reason: "NodesConverged"},
+		}, true),
+		Entry("preserves condition when type matches but reason differs", []metav1.Condition{
+			{Type: SkyhookConditionBlocked, Reason: "DependencyUninstalled"},
+		}, SkyhookConditionBlocked, SkyhookReasonNonInterruptPodsRunning, []metav1.Condition{
+			{Type: SkyhookConditionBlocked, Reason: "DependencyUninstalled"},
+		}, false),
+		Entry("preserves condition when reason matches but type differs", []metav1.Condition{
+			{Type: SkyhookConditionReady, Reason: SkyhookReasonNonInterruptPodsRunning},
+		}, SkyhookConditionBlocked, SkyhookReasonNonInterruptPodsRunning, []metav1.Condition{
+			{Type: SkyhookConditionReady, Reason: SkyhookReasonNonInterruptPodsRunning},
+		}, false),
+	)
+
+	DescribeTable("hasTrueSkyhookCondition", func(conditions []metav1.Condition, conditionTypes []string, expected bool) {
+		skyhook := &Skyhook{
+			NodeWright: &v1alpha1.NodeWright{
+				Status: v1alpha1.NodeWrightStatus{
+					Conditions: conditions,
+				},
+			},
+		}
+
+		Expect(HasTrueSkyhookCondition(skyhook, conditionTypes...)).To(Equal(expected))
+	},
+		Entry("returns false for a false condition", []metav1.Condition{
+			{Type: SkyhookConditionReady, Status: metav1.ConditionFalse},
+		}, []string{SkyhookConditionReady}, false),
+		Entry("returns false for an unknown condition", []metav1.Condition{
+			{Type: SkyhookConditionReady, Status: metav1.ConditionUnknown},
+		}, []string{SkyhookConditionReady}, false),
+		Entry("returns true when one of multiple requested condition types is true", []metav1.Condition{
+			{Type: SkyhookConditionNodesIgnored, Status: metav1.ConditionFalse},
+			{Type: SkyhookConditionApplyPackage, Status: metav1.ConditionTrue},
+		}, []string{SkyhookConditionNodesIgnored, SkyhookConditionApplyPackage}, true),
+	)
+
+	DescribeTable("legacySkyhookConditionType", func(conditionType, expected string) {
+		Expect(LegacySkyhookConditionType(conditionType)).To(Equal(expected))
+	},
+		Entry("returns empty for an empty condition type", "", ""),
+		Entry("maps Ready to the legacy metadata prefix", SkyhookConditionReady, fmt.Sprintf("%s/%s", v1alpha1.METADATA_PREFIX, SkyhookConditionReady)),
+		Entry("maps TaintNotTolerable to the legacy metadata prefix", SkyhookConditionTaintNotTolerable, fmt.Sprintf("%s/%s", v1alpha1.METADATA_PREFIX, SkyhookConditionTaintNotTolerable)),
+		Entry("maps NodesIgnored to the legacy metadata prefix", SkyhookConditionNodesIgnored, fmt.Sprintf("%s/%s", v1alpha1.METADATA_PREFIX, SkyhookConditionNodesIgnored)),
+		Entry("maps ApplyPackage to the legacy metadata prefix", SkyhookConditionApplyPackage, fmt.Sprintf("%s/%s", v1alpha1.METADATA_PREFIX, SkyhookConditionApplyPackage)),
+		Entry("maps DeploymentPolicyNotFound to the legacy metadata prefix", SkyhookConditionDeploymentPolicyNotFound, fmt.Sprintf("%s/%s", v1alpha1.METADATA_PREFIX, SkyhookConditionDeploymentPolicyNotFound)),
+		Entry("keeps the legacy Transition condition unchanged", LegacySkyhookConditionTransition, LegacySkyhookConditionTransition),
+		Entry("keeps already-prefixed condition types unchanged", fmt.Sprintf("%s/%s", v1alpha1.METADATA_PREFIX, SkyhookConditionReady), fmt.Sprintf("%s/%s", v1alpha1.METADATA_PREFIX, SkyhookConditionReady)),
+		Entry("mirrors unknown condition types by default", "SomeNewCondition", fmt.Sprintf("%s/%s", v1alpha1.METADATA_PREFIX, "SomeNewCondition")),
+	)
+
+	It("truncates formatted node lists beyond the display limit", func() {
+		nodes := make([]string, 0, ReadyConditionNodeListLimit+2)
+		for i := 1; i <= ReadyConditionNodeListLimit+2; i++ {
+			nodes = append(nodes, fmt.Sprintf("node-%02d", i))
+		}
+
+		Expect(FormatNodeList(nodes)).To(Equal(" (list truncated; see controller logs)"))
+	})
+
+	DescribeTable("DrainBlockedConditionReason", func(nodes []DrainBlockedNode, expected string) {
+		Expect(DrainBlockedConditionReason(nodes)).To(Equal(expected))
+	},
+		Entry("names the one reason on a single node", []DrainBlockedNode{
+			{NodeName: "node-a", Blocked: []drain.BlockedPod{
+				{Namespace: "default", Name: "web-0", Reason: drain.BlockReasonPodDisruptionBudget},
+				{Namespace: "default", Name: "web-1", Reason: drain.BlockReasonPodDisruptionBudget},
+			}},
+		}, string(drain.BlockReasonPodDisruptionBudget)),
+		Entry("names the one reason shared across nodes", []DrainBlockedNode{
+			{NodeName: "node-a", Blocked: []drain.BlockedPod{{Namespace: "default", Name: "scratch-a", Reason: drain.BlockReasonEmptyDirData}}},
+			{NodeName: "node-b", Blocked: []drain.BlockedPod{{Namespace: "default", Name: "scratch-b", Reason: drain.BlockReasonEmptyDirData}}},
+		}, string(drain.BlockReasonEmptyDirData)),
+		Entry("reports mixed reasons within one node as multiple causes", []DrainBlockedNode{
+			{NodeName: "node-a", Blocked: []drain.BlockedPod{
+				{Namespace: "default", Name: "web-0", Reason: drain.BlockReasonPodDisruptionBudget},
+				{Namespace: "default", Name: "debug", Reason: drain.BlockReasonUnmanagedPod},
+			}},
+		}, drainBlockedReasonMultiple),
+		Entry("reports different reasons across nodes as multiple causes", []DrainBlockedNode{
+			{NodeName: "node-a", Blocked: []drain.BlockedPod{{Namespace: "default", Name: "debug", Reason: drain.BlockReasonUnmanagedPod}}},
+			{NodeName: "node-b", Blocked: []drain.BlockedPod{{Namespace: "default", Name: "web-0", Reason: drain.BlockReasonPodDisruptionBudget}}},
+		}, drainBlockedReasonMultiple),
+	)
+
+	Describe("DrainBlockedConditionMessage", func() {
+		// A fresh value on every call, so a second call is an untouched copy to compare the input against.
+		unsortedNodes := func() []DrainBlockedNode {
+			return []DrainBlockedNode{
+				{NodeName: "node-b", Blocked: []drain.BlockedPod{
+					{Namespace: "default", Name: "web-1", Reason: drain.BlockReasonPodDisruptionBudget, Detail: "The disruption budget web-pdb needs 2 healthy pods and has 2 currently"},
+					{Namespace: "batch", Name: "scratch", Reason: drain.BlockReasonEmptyDirData},
+				}},
+				{NodeName: "node-a", Blocked: []drain.BlockedPod{
+					{Namespace: "default", Name: "zeta", Reason: drain.BlockReasonUnmanagedPod},
+					{Namespace: "default", Name: "alpha", Reason: drain.BlockReasonPodDisruptionBudget, Detail: "The disruption budget alpha-pdb needs 1 healthy pods and has 1 currently"},
+				}},
+			}
+		}
+
+		It("sorts nodes and pods and falls back to the reason for a blocker without detail", func() {
+			nodes := unsortedNodes()
+
+			Expect(DrainBlockedConditionMessage(nodes, 5)).To(Equal("2/5 nodes blocked draining (node-a, node-b); " +
+				"default/alpha on node-a: The disruption budget alpha-pdb needs 1 healthy pods and has 1 currently; " +
+				"default/zeta on node-a: UnmanagedPod; " +
+				"batch/scratch on node-b: EmptyDirData; " +
+				"default/web-1 on node-b: The disruption budget web-pdb needs 2 healthy pods and has 2 currently"))
+			Expect(nodes).To(Equal(unsortedNodes()), "the caller's nodes and pods must keep their order")
+		})
+
+		// Every blocker is an unmanaged pod without a detail, so each renders a ": UnmanagedPod" line.
+		blockedNodes := func(nodeCount, podsPerNode int) []DrainBlockedNode {
+			nodes := make([]DrainBlockedNode, 0, nodeCount)
+			for n := 1; n <= nodeCount; n++ {
+				node := DrainBlockedNode{NodeName: fmt.Sprintf("node-%02d", n)}
+				for p := 1; p <= podsPerNode; p++ {
+					node.Blocked = append(node.Blocked, drain.BlockedPod{Namespace: "default", Name: fmt.Sprintf("pod-%02d", p), Reason: drain.BlockReasonUnmanagedPod})
+				}
+				nodes = append(nodes, node)
+			}
+			return nodes
+		}
+
+		DescribeTable("caps the node list and the detail lines",
+			func(nodeCount, podsPerNode int, summary, ending string) {
+				message := DrainBlockedConditionMessage(blockedNodes(nodeCount, podsPerNode), 20)
+
+				Expect(message).To(HavePrefix(summary + "; "))
+				Expect(strings.Count(message, ": UnmanagedPod")).To(Equal(ReadyConditionNodeListLimit))
+				Expect(message).To(HaveSuffix(ending))
+			},
+			Entry("lists 10 nodes and all 10 detail lines", 10, 1,
+				"10/20 nodes blocked draining (node-01, node-02, node-03, node-04, node-05, node-06, node-07, node-08, node-09, node-10)",
+				"; default/pod-01 on node-10: UnmanagedPod"),
+			Entry("truncates the node list past 10 nodes", 11, 1,
+				"11/20 nodes blocked draining (list truncated; see controller logs)",
+				"; default/pod-01 on node-10: UnmanagedPod; (additional detail truncated; see controller logs)"),
+			Entry("caps the detail lines at 10 even on one node", 1, 11,
+				"1/20 nodes blocked draining (node-01)",
+				"; default/pod-10 on node-01: UnmanagedPod; (additional detail truncated; see controller logs)"),
+		)
+	})
+})

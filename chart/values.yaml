@@ -1,0 +1,250 @@
+controllerManager:
+  ## tolerations: add tolerations to the controller manager pod
+  ## Example below is for a system-cpu tainted node
+  # tolerations:
+  # - key: dedicated
+  #   operator: "Equal"
+  #   value: system-cpu
+  #   effect: NoSchedule
+  tolerations: []
+  ## selectors: add simple node selectors to the controller manager pod
+  ## Example below is for a system-workload node selector
+  ## NOTE: Cannot be used together with nodeAffinity.matchExpressions
+  # selectors:
+  #   dedicated: system-workload
+  selectors: {}
+  ## nodeAffinity: add advanced node affinity expressions to the controller manager pod
+  ## This allows for more complex node selection than simple selectors
+  ## NOTE: Cannot be used together with selectors - choose one approach
+  ## Example below shows how to select nodes with specific labels using expressions
+  # nodeAffinity:
+  #   matchExpressions:
+  #   - key: node-role.kubernetes.io/control-plane
+  #     operator: DoesNotExist
+  #   - key: dedicated
+  #     operator: In
+  #     values:
+  #     - system-workload
+  #     - gpu-workload
+  nodeAffinity:
+    matchExpressions: []
+  manager:
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop:
+        - ALL
+    env:
+      ## copyDirRoot is the directory for which the operator will work from on the host.
+      ## Some environments may require this to be set to a specific directory.
+      copyDirRoot: /var/lib/skyhook
+      ## agentLogRoot is the directory for which the agent will write logs.
+      ## Some environments may require this to be set to a specific directory.
+      agentLogRoot: /var/log/skyhook
+      ## leaderElection: "true" will enable leader election for the operator controller
+      ## Default is "true" and is required for production.
+      leaderElection: "true"
+      ## logLevel: "info" is the log level for the operator controller.
+      ## If you want more or less logs, change this value to "debug" or "error".
+      logLevel: info
+      metricsPort: :8443
+      probePort: :8081
+      ## pprofPort serves Go's net/http/pprof from the manager when set. Leave empty to keep it
+      ## off. Bind to loopback only (for example 127.0.0.1:6060) and reach it with
+      ## kubectl port-forward: the endpoint is unauthenticated and the NetworkPolicy allows all
+      ## ingress. Changing it restarts the manager. See docs/operations/resources-at-scale.md.
+      pprofPort: ""
+      ## memoryLimitFraction sets the Go soft memory limit (GOMEMLIMIT) to this share of the
+      ## manager's memory limit, so the garbage collector works harder as the heap nears the limit
+      ## instead of letting it grow to twice the live heap and getting OOM-killed. Must be greater
+      ## than 0 and at most 1; the manager fails at startup otherwise. The remainder is headroom for
+      ## memory outside the Go heap. See docs/operations/resources-at-scale.md.
+      memoryLimitFraction: "0.9"
+      ## reapplyOnReboot: "true" will reapply the packages on reboot. This is useful for systems that are read-only.
+      reapplyOnReboot: "false"
+      ## MIGRATION-SHIM (skyhook.nvidia.com -> nodewright.nvidia.com rename):
+      ## legacyCleanupDelay is how long after a Skyhook finishes migrating the operator keeps its
+      ## legacy skyhook.nvidia.com node state, pods, and ConfigMap labels around (a rollback window)
+      ## before pruning them. "0" prunes immediately (no rollback window). Removed at the removal release.
+      legacyCleanupDelay: "24h"
+      ## jobTtlSucceeded / jobTtlFailed set ttlSecondsAfterFinished on completed package-stage
+      ## Jobs by outcome, so failure logs outlive success logs.
+      ## Both have a hard floor of 1m: the operator fails validation at startup on anything
+      ## smaller, so "0" does NOT mean "keep forever" or "delete immediately" — it crashes.
+      jobTtlSucceeded: "1h"
+      jobTtlFailed: "24h"
+      ## jobStageTimeout is the default per-attempt deadline for a package stage Job when the
+      ## package itself sets no stageTimeout. "0" removes the time bound, leaving jobBackoffLimit
+      ## as the only limit — and a retry budget is only spent by attempts that FAIL, so with "0"
+      ## an attempt that hangs hangs forever. A pod the kubelet never acknowledges is unbounded at
+      ## any value, since the per-attempt clock starts from the pod's start time; that shows up as
+      ## a stage stuck in_progress with a Pending pod, and is node health rather than stage health.
+      ## Like jobBackoffLimit below, this is fixed when a stage's Job is created: changing it does
+      ## not affect Jobs already running. Clear those Jobs (`kubectl nodewright package rerun`) to
+      ## apply a new value to work already under way.
+      ## Interrupt stages are the exception: there the deadline bounds the whole stage, because
+      ## the attempt has to span a reboot. It is the only bound on a failing reboot interrupt,
+      ## which holds its node cordoned, drained and in_progress (node Status; the package's State
+      ## reads erroring) until it expires, indefinitely with "0" and no package stageTimeout.
+      ## Every other interrupt is ended sooner by
+      ## jobBackoffLimit below. See "A failing interrupt" under stageTimeout in
+      ## docs/user-guide/custom-resource.md.
+      jobStageTimeout: "1h"
+      ## jobBackoffLimit is how many retries a package stage gets after its first attempt before
+      ## its Job goes terminal — so a stage runs at most jobBackoffLimit+1 times. If a retained
+      ## attempt genuinely failed the stage then parks as erroring, awaiting a rerun/reset/config
+      ## change; otherwise it simply re-runs. It bounds every failure class, not just timeouts,
+      ## so raising it buys a crash-looping package more time to self-heal. Only failures count:
+      ## a pod lost to a disruption (eviction, preemption) spends nothing. "0" gives a stage a
+      ## single attempt with no retry. Interrupt stages other than a reboot get the same budget,
+      ## counted in the interrupt container's restarts, which include restarts that were not
+      ## failures, such as an unplanned node reboot: an interrupt that fails again with its restart
+      ## count at jobBackoffLimit has its Job failed, and its node reads erroring, after about 30
+      ## seconds of kubelet restart backoff with the default "3". A reboot is not counted, because its own
+      ## shutdown restarts it; jobStageTimeout bounds it instead. See "A failing interrupt" under
+      ## stageTimeout in docs/user-guide/custom-resource.md.
+      jobBackoffLimit: "3"
+      ## MIGRATION-SHIM (skyhook.nvidia.com -> nodewright.nvidia.com rename):
+      ## publishLegacyMetrics: "true" keeps the deprecated skyhook_* metric series exported alongside
+      ## the current nodewright_* ones, so existing Grafana dashboards and Prometheus alerts keep
+      ## working across the rename. Set "false" to export only nodewright_*, which halves the
+      ## operator's exported series count but breaks any consumer still querying the legacy names.
+      ## The legacy series are removed unconditionally at the removal release.
+      publishLegacyMetrics: "true"
+      ## runtimeRequiredTaint: This feature assumes nodes are added to the cluster with `--register-with-taints` kubelet flag.
+      ## This taint is assume to be all new nodes, and skyhook pods will tolerate this taint, and remove it one the nodes packages are complete.
+      ## NOTE: If your systems nodes have this taint make sure to add the toleration to the controllerManager.tolerations
+      ## The key must have no DNS prefix and be at most 53 characters; values.schema.json fails helm install/upgrade otherwise.
+      ## MIGRATION-SHIM (skyhook.nvidia.com -> nodewright.nvidia.com rename): the default moved from
+      ## `skyhook.nvidia.com=runtime-required:NoSchedule` to the key below. For the deprecation window the operator
+      ## also tolerates and removes the legacy key, so a cluster whose autoscaler/node template still stamps
+      ## `skyhook.nvidia.com` keeps working. Update that provisioning config before the removal release; see
+      ## docs/user-guide/runtime-required.md.
+      runtimeRequiredTaint: nodewright.nvidia.com=runtime-required:NoSchedule
+      ## puaseImage: is the image used for the pause container in the operator controller.
+      pauseImage: registry.k8s.io/pause:3.10
+    image:
+      repository: ghcr.io/nvidia/nodewright/operator
+      tag: "v0.21.0" ## if both tag and digest are omitted, defaults to the chart appVersion
+      digest: "sha256:d9ff4e5bd44e21b24baf727f8e2a0b57f0d5f4cf17b9a90b2a4b307930b238cd" # manifest list digest (multi-arch) on ghcr.io/nvidia/nodewright/operator:v0.21.0
+    ## agentImage: is the image used for the agent container. This image is the default for this install, but can be overridden in the CR at package level.
+    agent:
+      repository: ghcr.io/nvidia/nodewright/agent
+      tag: "v7.0.0"
+      digest: "sha256:7cf394273374142370473cd3df191b9a40d2d1a7f0ac119b922e5c90c88a592b" # manifest list digest (multi-arch) on ghcr.io/nvidia/nodewright/agent:v7.0.0
+
+    # resources: If this is defined it will override the default calculation for resources
+    # from estimatedNodeCount and estimatedPackageCount. The below values are
+    # what will be calculated until nodes > 1000 and packages 1-2 or nodes > 500 and packages >= 4
+    # resources:
+    #   limits:
+    #     cpu: 1000m
+    #     memory: 512Mi
+    #   requests:
+    #     cpu: 200m
+    #     memory: 64Mi
+  ## replicas: number of the operator controller instances to run. This should be set to 2 or more for production.
+  replicas: 2 ## more than 1 need to make sure leaderElection is on
+  ## podDisruptionBudget: pod disruption budget for the operator controller, this should be left as is for production deployments.
+  podDisruptionBudget:
+    minAvailable: 1 ## need to be in sync with replicas, but less than
+  serviceAccount:
+    annotations: {}
+kubernetesClusterDomain: cluster.local
+metricsService:
+  ## The HTTPS endpoint requires bearer authentication and uses per-pod
+  ## self-signed certificates. Add discovery annotations only when the scraper
+  ## is configured for both; the chart does not advertise an unusable target.
+  annotations: {}
+  ports:
+  - name: metrics
+    port: 8443
+    targetPort: 8443
+    protocol: TCP
+  type: ClusterIP
+webhookService:
+  ports:
+  - name: webhook
+    port: 443
+    protocol: TCP
+    targetPort: 9443
+  type: ClusterIP
+rbac:
+  createSkyhookViewerRole: false
+  createSkyhookEditorRole: false
+## imagePullSecret: is the secret used to pull the operator controller image, agent image, and package images.
+imagePullSecret: ""
+## useHostNetwork: Whether the Operator pods should use hostNetwork: true or false
+useHostNetwork: false
+## estimatedPackageCount: estimated number of packages to be installed on the cluster
+## this is used to calculate the resources for the operator controller
+estimatedPackageCount: 1
+## estimatedNodeCount: estimated number of nodes in the cluster
+## this is used to calculate the resources for the operator controller
+estimatedNodeCount: 1
+
+## webhook config
+webhook:
+  ## secretName: name of the secret to store the webhook certificate
+  secretName: webhook-cert
+  ## serviceName: name of the service to expose the webhook.
+  ## Empty derives it from the chart fullname (`<fullname>-webhook-service`). The
+  ## operator is handed this name as WEBHOOK_SERVICE_NAME so its self-signed
+  ## serving cert carries the matching SAN; overriding it renames both together.
+  serviceName: ""
+  ## enable: "true" will enable the webhook setup in the operator controller.
+  ## Default is "true" and is required for production.
+  enable: true
+
+  ## kubectl image used by the maintenance jobs (webhook + skyhook cleanup
+  ## pre-delete hooks and the selector-migration pre-upgrade hook). Pinned to a
+  ## maintained, versioned, multi-arch alpine/kubectl release; keep the tag in
+  ## skew with the supported Kubernetes range and bump per docs/contributing/release-process.md.
+  ## Keep the registry host explicit: short-name-enforcing runtimes reject unqualified references.
+  removalImage: docker.io/alpine/kubectl
+  removalTag: 1.36.2
+  removalDigest: "sha256:01d138ce994b684abc62d9cfdff44de42a4c8996dcc12626dd0193afc3fb5a95"
+
+## cleanup: Configuration for pre-delete cleanup jobs
+cleanup:
+  ## enabled: When true, automatically deletes all Skyhook and DeploymentPolicy
+  ## resources before helm uninstall. Recommended to prevent orphaned CRs.
+  enabled: true
+  ## jobTimeoutSeconds: Hard deadline for the entire cleanup job.
+  ## The job will be killed if it exceeds this time.
+  jobTimeoutSeconds: 120
+
+## selectorMigration: pre-upgrade hook for the upgrade states helm cannot patch
+## in place. It deletes the controller-manager Deployment, so helm recreates it,
+## and ONLY when one of these holds:
+##   - the live Deployment's selector does not match the chart's desired selector
+##     (spec.selector is immutable, e.g. across the skyhook-operator -> nodewright
+##     chart rename), or
+##   - the live operator predates label-based webhook discovery, which would
+##     otherwise deadlock the rollout when the webhook configurations are renamed.
+## It is a no-op on normal upgrades.
+selectorMigration:
+  ## enabled: When true, run the selector-migration pre-upgrade hook. Safe to
+  ## leave on; disable if your GitOps tooling manages the Deployment directly.
+  enabled: true
+  ## jobTimeoutSeconds: Hard deadline for the migration job.
+  jobTimeoutSeconds: 120
+
+metrics:
+  addServiceAccountBinding: false
+  serviceAccountName: prometheus
+  serviceAccountNamespace: monitoring
+
+## limitRange: is the limit range for the operator controller.
+## This sets for all containers in the namespace.
+## So if your package does not override the limits, these are what will be used.
+## if you omit this, the we will not create a limit range.
+## best practice on limits and requests is to make make the limits 2x the requests max.
+limitRange:
+  default:
+    cpu: "500m"
+    memory: "512Mi"
+  defaultRequest:
+    cpu: "250m"
+    memory: "256Mi"

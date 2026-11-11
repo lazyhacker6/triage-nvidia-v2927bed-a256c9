@@ -1,0 +1,201 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package dal
+
+import (
+	"context"
+	"fmt"
+
+	skyhookv1alpha1 "github.com/NVIDIA/nodewright/operator/api/nodewright/v1alpha1"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+// New builds the DAL over the controller-runtime client used for every typed get/list.
+func New(c client.Client) DAL {
+	return &dal{client: c}
+}
+
+// DAL gives a typed interface to the kubernetes interface which is generic ano not typed
+// I find this to be more readable and using the generated mock is easier too
+// get and list are hard to mock, update is not an issue, but might as well live here too
+type DAL interface {
+	GetSkyhook(ctx context.Context, name string, opts ...client.ListOption) (*skyhookv1alpha1.NodeWright, error)
+	GetSkyhooks(ctx context.Context, opts ...client.ListOption) (*skyhookv1alpha1.NodeWrightList, error)
+	GetNode(ctx context.Context, nodeName string) (*corev1.Node, error)
+	GetNodes(ctx context.Context, opts ...client.ListOption) (*corev1.NodeList, error)
+	GetPod(ctx context.Context, namespace, name string) (*corev1.Pod, error)
+	GetPods(ctx context.Context, opts ...client.ListOption) (*corev1.PodList, error)
+	GetJob(ctx context.Context, namespace, name string) (*batchv1.Job, error)
+	GetJobs(ctx context.Context, opts ...client.ListOption) (*batchv1.JobList, error)
+	GetDeploymentPolicies(ctx context.Context, opts ...client.ListOption) (*skyhookv1alpha1.DeploymentPolicyList, error)
+	GetDeploymentPolicy(ctx context.Context, name string) (*skyhookv1alpha1.DeploymentPolicy, error)
+}
+
+type dal struct {
+	client client.Client
+}
+
+func (e *dal) GetSkyhook(ctx context.Context, name string, opts ...client.ListOption) (*skyhookv1alpha1.NodeWright, error) {
+	var skyhook skyhookv1alpha1.NodeWright
+
+	// nodes does have namespace so leaving blank
+	if err := e.client.Get(ctx, types.NamespacedName{Name: name}, &skyhook); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("error getting nodewright [%s]: %w", name, err)
+	}
+
+	return &skyhook, nil
+}
+
+func (e *dal) GetSkyhooks(ctx context.Context, opts ...client.ListOption) (*skyhookv1alpha1.NodeWrightList, error) {
+
+	var skyhook skyhookv1alpha1.NodeWrightList
+	if err := e.client.List(ctx, &skyhook, opts...); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("error getting nodewrights: %w", err)
+	}
+
+	if len(skyhook.Items) == 0 {
+		return nil, nil
+	}
+
+	return &skyhook, nil
+}
+
+func (e *dal) GetNode(ctx context.Context, nodeName string) (*corev1.Node, error) {
+	var node corev1.Node
+
+	// nodes does have namespace so leaving blank
+	if err := e.client.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("error getting node [%s]: %w", nodeName, err)
+	}
+
+	return &node, nil
+}
+
+func (e *dal) GetNodes(ctx context.Context, opts ...client.ListOption) (*corev1.NodeList, error) {
+	var nodes corev1.NodeList
+	if err := e.client.List(ctx, &nodes, opts...); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("error getting nodes: %w", err)
+	}
+
+	if len(nodes.Items) == 0 {
+		return nil, nil
+	}
+
+	return &nodes, nil
+}
+
+func (e *dal) GetPod(ctx context.Context, namespace, name string) (*corev1.Pod, error) {
+	var pod corev1.Pod
+
+	if err := e.client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &pod); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("error getting pod [%s|%s]: %w", namespace, name, err)
+	}
+
+	return &pod, nil
+}
+
+func (e *dal) GetPods(ctx context.Context, opts ...client.ListOption) (*corev1.PodList, error) {
+	var pods corev1.PodList
+	if err := e.client.List(ctx, &pods, opts...); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("error getting pods: %w", err)
+	}
+
+	if len(pods.Items) == 0 {
+		return nil, nil
+	}
+
+	return &pods, nil
+}
+
+func (e *dal) GetJob(ctx context.Context, namespace, name string) (*batchv1.Job, error) {
+	var job batchv1.Job
+
+	if err := e.client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &job); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("error getting job [%s|%s]: %w", namespace, name, err)
+	}
+
+	return &job, nil
+}
+
+func (e *dal) GetJobs(ctx context.Context, opts ...client.ListOption) (*batchv1.JobList, error) {
+	var jobs batchv1.JobList
+	if err := e.client.List(ctx, &jobs, opts...); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("error getting jobs: %w", err)
+	}
+
+	if len(jobs.Items) == 0 {
+		return nil, nil
+	}
+
+	return &jobs, nil
+}
+
+func (e *dal) GetDeploymentPolicies(ctx context.Context, opts ...client.ListOption) (*skyhookv1alpha1.DeploymentPolicyList, error) {
+	var policies skyhookv1alpha1.DeploymentPolicyList
+	if err := e.client.List(ctx, &policies, opts...); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("error getting deployment policies: %w", err)
+	}
+
+	return &policies, nil
+}
+
+func (e *dal) GetDeploymentPolicy(ctx context.Context, name string) (*skyhookv1alpha1.DeploymentPolicy, error) {
+	var policy skyhookv1alpha1.DeploymentPolicy
+
+	// DeploymentPolicy is cluster-scoped, so no namespace is needed
+	if err := e.client.Get(ctx, types.NamespacedName{Name: name}, &policy); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("error getting deployment policy [%s]: %w", name, err)
+	}
+
+	return &policy, nil
+}

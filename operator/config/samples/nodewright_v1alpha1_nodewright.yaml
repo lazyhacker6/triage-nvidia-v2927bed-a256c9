@@ -1,0 +1,86 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: nodewright.nvidia.com/v1alpha1
+kind: NodeWright
+metadata:
+  labels:
+    app.kubernetes.io/name: nodewright
+    app.kubernetes.io/instance: nodewright-sample
+    app.kubernetes.io/part-of: nodewright
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/created-by: nodewright
+  name: nodewright-sample
+spec:
+  additionalTolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+  nodeSelectors:
+    matchLabels:
+      agentpool: gpu
+  podNonInterruptLabels:
+    matchLabels:
+      key: value
+  interruptionBudget: 
+    percent: 33
+  packages:
+    something-important:
+      version: 1.0.0
+      image: ghcr.io/nvidia/skyhook-packages/shellscript
+      dependsOn:
+        tuning: 1.0.0
+      configMap:
+        apply.sh: |-
+          #!/bin/bash
+          echo "hello world" > /skyhook-hello-world
+          sleep 60
+        apply_check.sh: |-
+          #!/bin/bash
+          cat /skyhook-hello-world
+          sleep 30
+        config.sh: |-
+          #!/bin/bash
+          echo "a config is run" >> /skyhook-hello-world
+          sleep 60
+        config_check.sh: |-
+          #!/bin/bash
+          grep "config" /skyhook-hello-world
+          sleep 30
+    tuning:
+      version: 1.0.0
+      image: ghcr.io/nvidia/skyhook-packages/tuning
+      interrupt:
+          type: reboot
+      configInterrupts:
+        grub.conf:
+          type: reboot
+        sysctl.conf:
+          type: restartAllServices
+      configMap:
+        grub.conf: |-
+            hugepagesz=1G
+            hugepages=2
+            hugepagesz=2M
+            hugepages=5128
+        sysctl.conf: |-
+            fs.inotify.max_user_instances=65535
+            fs.inotify.max_user_watches=524288
+            kernel.threads-max=16512444
+            vm.max_map_count=262144
+            vm.min_free_kbytes=65536
+        ulimit.conf: |-
+            memlock: 128
+            fsize: 1000

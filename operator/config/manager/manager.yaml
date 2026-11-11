@@ -1,0 +1,201 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: namespace
+    app.kubernetes.io/instance: system
+    app.kubernetes.io/component: manager
+    app.kubernetes.io/created-by: nodewright
+    app.kubernetes.io/part-of: nodewright
+    app.kubernetes.io/managed-by: kustomize
+  name: system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller-manager
+  namespace: system
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: deployment
+    app.kubernetes.io/instance: controller-manager
+    app.kubernetes.io/component: manager
+    app.kubernetes.io/created-by: nodewright
+    app.kubernetes.io/part-of: nodewright
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+  replicas: 1
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: manager
+      labels:
+        control-plane: controller-manager
+    spec:
+      # TODO(user): Uncomment the following code to configure the nodeAffinity expression
+      # according to the platforms which are supported by your solution.
+      # It is considered best practice to support multiple architectures. You can
+      # build your manager image using the makefile target docker-buildx.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                - key: kubernetes.io/arch
+                  operator: In
+                  values:
+                    - amd64
+                    - arm64 ## currently we don't really support this because of issues building with a gitlab runner, but leaving this we can test local kind seems to still work, but does not if removed
+                - key: kubernetes.io/os
+                  operator: In
+                  values:
+                    - linux
+        # Mirrors the podAntiAffinity in the chart's controller-manager Deployment. Kubernetes
+        # never rebalances running pods, so without this replicas stay wherever they first
+        # landed and a single node drain can take the whole operator out. Preferred rather than
+        # required so a single-node cluster still schedules.
+        #
+        # Selects on control-plane rather than the chart's app label because the pods this
+        # Deployment creates carry only control-plane; an app selector would match nothing here.
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    control-plane: controller-manager
+      securityContext:
+        runAsNonRoot: true
+        # TODO(user): For common cases that do not require escalating privileges
+        # it is recommended to ensure that all your Pods/Containers are restrictive.
+        # More info: https://kubernetes.io/docs/concepts/security/pod-security-standards/#restricted
+        # Please uncomment the following code if your project does NOT have to work on old Kubernetes
+        # versions < 1.19 or on vendors versions which do NOT support this field by default (i.e. Openshift < 4.11 ).
+        # seccompProfile:
+        #   type: RuntimeDefault
+      # imagePullSecrets: 
+      #   - name: node-init-secret
+      containers:
+      - command:
+        - /manager
+        env:
+          - name: METRICS_PORT
+            value: ":8443"
+          - name: PROBE_PORT
+            value: ":8081"
+          - name: PPROF_PORT
+            value: ""
+          - name: GOMEMLIMIT_FRACTION
+            value: "0.9"
+          - name: LEADER_ELECTION
+            value: "true"
+          - name: LOG_LEVEL
+            value: info
+          - name: ENABLE_WEBHOOKS
+            value: "true"
+          # Must match the Service the overlay renders (config/default namePrefix +
+          # config/webhook/service.yaml). The operator puts WEBHOOK_SERVICE_NAME in
+          # the SAN of the serving cert it mints, so a mismatch fails admission
+          # closed rather than erroring at startup.
+          - name: WEBHOOK_SERVICE_NAME
+            value: nodewright-webhook-service
+          - name: NAMESPACE
+            value: nodewright-operator-system
+          - name: IMAGE_PULL_SECRET
+            value: ""
+          - name: COPY_DIR_ROOT
+            value: /var/lib/skyhook
+          - name: REAPPLY_ON_REBOOT
+            value: "false"
+          # MIGRATION-SHIM: rollback window before pruning legacy skyhook.nvidia.com
+          # node state / pods / ConfigMap labels after a Skyhook migrates. 0 prunes
+          # immediately. Remove with the legacy group at the removal release.
+          - name: LEGACY_CLEANUP_DELAY
+            value: "24h"
+          # JobTTLSucceeded/JobTTLFailed set ttlSecondsAfterFinished on completed
+          # package-stage Jobs by outcome; JobStageTimeout is the default per-attempt
+          # deadline when a package sets no stageTimeout (0 removes the time bound);
+          # JobBackoffLimit is how many retries a package stage gets after its first attempt
+          # before its Job goes terminal, so a stage runs at most JobBackoffLimit+1 times; it
+          # parks as erroring only if a retained attempt genuinely failed.
+          # Interrupt stages are the exception. JobStageTimeout bounds the whole interrupt
+          # stage, and is the only bound on a failing reboot interrupt, whose own shutdown
+          # restarts it (indefinitely with 0: the node's Status stays in_progress while the
+          # package's State reads erroring). Every other interrupt gets JobBackoffLimit
+          # counted in its container's restarts, which include restarts that were not
+          # failures, and its Job is failed once it fails again at that count. See "A failing
+          # interrupt" in docs/user-guide/custom-resource.md.
+          - name: JOB_TTL_SUCCEEDED
+            value: "1h"
+          - name: JOB_TTL_FAILED
+            value: "24h"
+          - name: JOB_STAGE_TIMEOUT
+            value: "1h"
+          - name: JOB_BACKOFF_LIMIT
+            value: "3"
+          # MIGRATION-SHIM: keep the deprecated skyhook_* metric series exported
+          # alongside nodewright_* so existing dashboards and alerts survive the
+          # rename. "false" exports only nodewright_*. Remove with the legacy group
+          # at the removal release.
+          - name: PUBLISH_LEGACY_METRICS
+            value: "true"
+          - name: RUNTIME_REQUIRED_TAINT
+            value: nodewright.nvidia.com=runtime-required:NoSchedule
+          - name: PAUSE_IMAGE
+            value: registry.k8s.io/pause:3.10
+          - name: AGENT_IMAGE
+            value: ghcr.io/nvidia/nodewright/agent:latest
+        image: controller:latest
+        name: manager
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - "ALL"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 20
+          successThreshold: 1
+          failureThreshold: 2
+          timeoutSeconds: 3
+        # TODO(user): Configure the resources accordingly based on the project requirements.
+        # More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+        resources:
+          limits:
+            cpu: 500m
+            memory: 512Mi
+          requests:
+            cpu: 50m
+            memory: 64Mi
+      serviceAccountName: controller-manager
+      terminationGracePeriodSeconds: 10

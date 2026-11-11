@@ -1,0 +1,1121 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package wrapper
+
+import (
+	"maps"
+	"slices"
+	"time"
+
+	"github.com/NVIDIA/nodewright/operator/api/nodewright/v1alpha1"
+	"github.com/NVIDIA/nodewright/operator/internal/drain"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+var _ = Describe("SkyhookNode", func() {
+	Context("Upsert and the owed own interrupt", func() {
+		It("flags only a package that declares its own interrupt", func() {
+			node := corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "test-node"}}
+			skyhook := v1alpha1.NodeWright{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-skyhook"},
+				Spec: v1alpha1.NodeWrightSpec{
+					Packages: map[string]v1alpha1.Package{
+						"with": {
+							PackageRef: v1alpha1.PackageRef{Name: "with", Version: "1.0"},
+							Image:      "img",
+							Interrupt:  &v1alpha1.Interrupt{Type: v1alpha1.REBOOT},
+						},
+						"without": {PackageRef: v1alpha1.PackageRef{Name: "without", Version: "1.0"}, Image: "img"},
+					},
+				},
+			}
+			skyhookNode, err := NewSkyhookNode(&node, &skyhook)
+			Expect(err).NotTo(HaveOccurred())
+
+			for _, name := range []string{"with", "without"} {
+				Expect(skyhookNode.Upsert(v1alpha1.PackageRef{Name: name, Version: "1.0"}, "img", v1alpha1.StateInProgress, v1alpha1.StageApply, 0, "")).To(Succeed())
+			}
+
+			with, _ := skyhookNode.PackageStatus("with|1.0")
+			without, _ := skyhookNode.PackageStatus("without|1.0")
+			Expect(with.InterruptPending).To(BeTrue())
+			Expect(without.InterruptPending).To(BeFalse())
+			withPkg := skyhook.Spec.Packages["with"]
+			Expect(skyhookNode.OwesOwnInterrupt(&withPkg)).To(BeTrue())
+		})
+	})
+
+	Context("RunNext", func() {
+		It("should return packages in deterministic order and respect dependencies", func() {
+			node := corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-node",
+				},
+			}
+			skyhook := v1alpha1.NodeWright{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-skyhook",
+				},
+				Spec: v1alpha1.NodeWrightSpec{
+					Packages: map[string]v1alpha1.Package{
+						"a-package": {
+							PackageRef: v1alpha1.PackageRef{Name: "a-package", Version: "1.0"},
+							Image:      "a-image",
+						},
+						"b-package": {
+							PackageRef: v1alpha1.PackageRef{Name: "b-package", Version: "1.0"},
+							Image:      "b-image",
+						},
+						"c-package": {
+							PackageRef: v1alpha1.PackageRef{Name: "c-package", Version: "1.0"},
+							Image:      "c-image",
+							DependsOn:  map[string]string{"a-package": "1.0", "b-package": "1.0"},
+						},
+						"d-package": {
+							PackageRef: v1alpha1.PackageRef{Name: "d-package", Version: "1.0"},
+							Image:      "d-image",
+							DependsOn:  map[string]string{"c-package": "1.0"},
+						},
+						"e-package": {
+							PackageRef: v1alpha1.PackageRef{Name: "e-package", Version: "1.0"},
+							Image:      "e-image",
+							DependsOn:  map[string]string{"c-package": "1.0"},
+						},
+						"f-package": {
+							PackageRef: v1alpha1.PackageRef{Name: "f-package", Version: "1.0"},
+							Image:      "f-image",
+							DependsOn:  map[string]string{"d-package": "1.0", "e-package": "1.0"},
+						},
+					},
+				},
+			}
+
+			// Create node
+			skyhookNode, err := NewSkyhookNode(&node, &skyhook)
+			Expect(err).NotTo(HaveOccurred())
+
+			// First run should return a and b in alphabetical order
+			pkgs, err := skyhookNode.RunNext()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pkgs).To(HaveLen(2))
+			Expect(pkgs[0].Name).To(Equal("a-package"))
+			Expect(pkgs[1].Name).To(Equal("b-package"))
+
+			// Complete b-package
+			err = skyhookNode.Upsert(v1alpha1.PackageRef{Name: "b-package", Version: "1.0"}, "image", v1alpha1.StateComplete, v1alpha1.StageConfig, 0, "")
+			Expect(err).NotTo(HaveOccurred())
+			// Should still get a-package since c-package depends on both a and b
+			pkgs, err = skyhookNode.RunNext()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pkgs).To(HaveLen(1))
+			Expect(pkgs[0].Name).To(Equal("a-package"))
+
+			// Complete a-package
+			err = skyhookNode.Upsert(v1alpha1.PackageRef{Name: "a-package", Version: "1.0"}, "image", v1alpha1.StateComplete, v1alpha1.StageConfig, 0, "")
+			Expect(err).NotTo(HaveOccurred())
+			// Now should get c-package since both dependencies are complete
+			pkgs, err = skyhookNode.RunNext()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pkgs).To(HaveLen(1))
+			Expect(pkgs[0].Name).To(Equal("c-package"))
+
+			// Complete c-package
+			err = skyhookNode.Upsert(v1alpha1.PackageRef{Name: "c-package", Version: "1.0"}, "image", v1alpha1.StateComplete, v1alpha1.StageConfig, 0, "")
+			Expect(err).NotTo(HaveOccurred())
+			// Now should get d-package since c-package is complete
+			pkgs, err = skyhookNode.RunNext()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pkgs).To(HaveLen(2))
+			Expect(pkgs[0].Name).To(Equal("d-package"))
+			Expect(pkgs[1].Name).To(Equal("e-package"))
+
+			// Complete e-package
+			err = skyhookNode.Upsert(v1alpha1.PackageRef{Name: "e-package", Version: "1.0"}, "image", v1alpha1.StateComplete, v1alpha1.StageConfig, 0, "")
+			Expect(err).NotTo(HaveOccurred())
+			// Now should get d-package since c-package and e-package are complete
+			pkgs, err = skyhookNode.RunNext()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pkgs).To(HaveLen(1))
+			Expect(pkgs[0].Name).To(Equal("d-package"))
+
+			// Complete d-package
+			err = skyhookNode.Upsert(v1alpha1.PackageRef{Name: "d-package", Version: "1.0"}, "image", v1alpha1.StateComplete, v1alpha1.StageConfig, 0, "")
+			Expect(err).NotTo(HaveOccurred())
+			// Now should get f-package since both d-package and e-package are complete
+			pkgs, err = skyhookNode.RunNext()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pkgs).To(HaveLen(1))
+			Expect(pkgs[0].Name).To(Equal("f-package"))
+
+			// Complete f-package
+			err = skyhookNode.Upsert(v1alpha1.PackageRef{Name: "f-package", Version: "1.0"}, "image", v1alpha1.StateComplete, v1alpha1.StageConfig, 0, "")
+			Expect(err).NotTo(HaveOccurred())
+			// Now should get nothing since all packages are complete
+			pkgs, err = skyhookNode.RunNext()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pkgs).To(BeEmpty())
+		})
+
+		// Mirrors simple-update-skyhook after its update step: three packages with no
+		// dependsOn (baxter, dexter, jackie-chan) plus two that depend on dexter. A
+		// dependency-free package is nobody's child, so it has to stay runnable until it
+		// is itself complete, including once more packages are complete than there are
+		// dependency-free ones. Regression for the stall that parked a package at
+		// apply/complete and left the NodeWright in_progress forever.
+		It("still returns a dependency-free package once more packages are complete than there are roots", func() {
+			node := corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "test-node"}}
+			skyhook := v1alpha1.NodeWright{
+				ObjectMeta: metav1.ObjectMeta{Name: "simple-update-skyhook"},
+				Spec: v1alpha1.NodeWrightSpec{
+					Packages: map[string]v1alpha1.Package{
+						"baxter":      {PackageRef: v1alpha1.PackageRef{Name: "baxter", Version: "2.3.1-test"}, Image: "img"},
+						"dexter":      {PackageRef: v1alpha1.PackageRef{Name: "dexter", Version: "1.2.3"}, Image: "img"},
+						"jackie-chan": {PackageRef: v1alpha1.PackageRef{Name: "jackie-chan", Version: "2024.7.7-test"}, Image: "img"},
+						"foobar":      {PackageRef: v1alpha1.PackageRef{Name: "foobar", Version: "1.2"}, Image: "img", DependsOn: map[string]string{"dexter": "1.2.3"}},
+						"spencer":     {PackageRef: v1alpha1.PackageRef{Name: "spencer", Version: "3.2.3"}, Image: "img", DependsOn: map[string]string{"dexter": "1.2.3"}},
+					},
+				},
+			}
+
+			skyhookNode, err := NewSkyhookNode(&node, &skyhook)
+			Expect(err).NotTo(HaveOccurred())
+
+			// everything except jackie-chan reaches config/complete
+			for _, ref := range []v1alpha1.PackageRef{
+				{Name: "baxter", Version: "2.3.1-test"},
+				{Name: "dexter", Version: "1.2.3"},
+				{Name: "foobar", Version: "1.2"},
+				{Name: "spencer", Version: "3.2.3"},
+			} {
+				Expect(skyhookNode.Upsert(ref, "img", v1alpha1.StateComplete, v1alpha1.StageConfig, 0, "")).To(Succeed())
+			}
+
+			// jackie-chan finished apply and is waiting to be advanced to config
+			Expect(skyhookNode.Upsert(v1alpha1.PackageRef{Name: "jackie-chan", Version: "2024.7.7-test"},
+				"img", v1alpha1.StateComplete, v1alpha1.StageApply, 0, "")).To(Succeed())
+
+			Expect(skyhookNode.IsComplete()).To(BeFalse())
+
+			pkgs, err := skyhookNode.RunNext()
+			Expect(err).NotTo(HaveOccurred())
+
+			names := make([]string, 0, len(pkgs))
+			for _, p := range pkgs {
+				names = append(names, p.Name)
+			}
+			Expect(names).To(ContainElement("jackie-chan"),
+				"jackie-chan is incomplete and has no unmet dependencies, so it must still be runnable")
+		})
+	})
+
+	Context("HasSkyhookAnnotations", func() {
+		It("should return false for node with no annotations", func() {
+			node := &skyhookNode{Node: &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "new-node",
+				},
+			},
+			}
+			Expect(node.HasSkyhookAnnotations()).To(BeFalse())
+		})
+
+		It("should return false for node with non-skyhook annotations", func() {
+			node := &skyhookNode{Node: &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "node-with-other-annotations",
+					Annotations: map[string]string{
+						"kubernetes.io/arch": "amd64",
+						"some-other/key":     "value",
+					},
+				},
+			},
+			}
+			Expect(node.HasSkyhookAnnotations()).To(BeFalse())
+		})
+
+		It("should return true for node with skyhook annotations", func() {
+			node := &skyhookNode{Node: &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "processed-node",
+					Annotations: map[string]string{
+						"nodewright.nvidia.com/nodeState_myskyhook": `{"some":"state"}`,
+					},
+				},
+			},
+			}
+			Expect(node.HasSkyhookAnnotations()).To(BeTrue())
+		})
+	})
+
+	Context("SetStatus and Status", func() {
+		const skyhookName = "my-skyhook"
+		statusKey := statusMetadataKey(skyhookName)
+
+		newNode := func(annotations, labels map[string]string) (*corev1.Node, SkyhookNodeOnly) {
+			GinkgoHelper()
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "test-node",
+					Annotations: annotations,
+					Labels:      labels,
+				},
+			}
+
+			sn, err := NewSkyhookNodeOnly(node, skyhookName)
+			Expect(err).ToNot(HaveOccurred())
+			return node, sn
+		}
+
+		// The annotation and the label are one unit, and SetStatus is the only thing that
+		// ever repairs the label. Comparing just the annotation to the desired status and
+		// writing both inside that branch made every annotation-already-matches case below
+		// a silent no-op, so a label that drifted on its own stayed drifted forever.
+		DescribeTable("writes both carriers so the annotation and the label agree",
+			func(annotations, labels map[string]string, want v1alpha1.Status) {
+				node, sn := newNode(annotations, labels)
+
+				sn.SetStatus(want)
+
+				Expect(node.Annotations).To(HaveKeyWithValue(statusKey, string(want)))
+				Expect(node.Labels).To(HaveKeyWithValue(statusKey, string(want)))
+				Expect(sn.Status()).To(Equal(want))
+				Expect(sn.Changed()).To(BeTrue())
+			},
+			Entry("no status metadata at all",
+				nil, nil, v1alpha1.StatusInProgress),
+			Entry("label missing while the annotation already matches",
+				map[string]string{statusKey: string(v1alpha1.StatusComplete)},
+				map[string]string{},
+				v1alpha1.StatusComplete),
+			Entry("labels map nil while the annotation already matches",
+				map[string]string{statusKey: string(v1alpha1.StatusInProgress)},
+				nil,
+				v1alpha1.StatusInProgress),
+			Entry("label stuck at erroring while the annotation already matches",
+				map[string]string{statusKey: string(v1alpha1.StatusComplete)},
+				map[string]string{statusKey: string(v1alpha1.StatusErroring)},
+				v1alpha1.StatusComplete),
+			Entry("annotation stale while the label already matches",
+				map[string]string{statusKey: string(v1alpha1.StatusErroring)},
+				map[string]string{statusKey: string(v1alpha1.StatusComplete)},
+				v1alpha1.StatusComplete),
+			Entry("both stale",
+				map[string]string{statusKey: string(v1alpha1.StatusErroring)},
+				map[string]string{statusKey: string(v1alpha1.StatusErroring)},
+				v1alpha1.StatusComplete),
+		)
+
+		// IntrospectNode repairs node metadata once per pass with SetStatus(Status()), which
+		// feeds the annotation's own value back in. That call is the whole repair path for a
+		// drifted label, and it has to mark the node changed or the repair never leaves memory.
+		It("repairs a drifted label through the SetStatus(Status()) self-heal", func() {
+			node, sn := newNode(
+				map[string]string{statusKey: string(v1alpha1.StatusComplete)},
+				map[string]string{statusKey: string(v1alpha1.StatusErroring)},
+			)
+
+			sn.SetStatus(sn.Status())
+
+			Expect(node.Labels).To(HaveKeyWithValue(statusKey, string(v1alpha1.StatusComplete)))
+			Expect(sn.Changed()).To(BeTrue())
+		})
+
+		It("should not mark the node changed when both carriers already match", func() {
+			node, sn := newNode(
+				map[string]string{statusKey: string(v1alpha1.StatusInProgress)},
+				map[string]string{statusKey: string(v1alpha1.StatusInProgress)},
+			)
+
+			sn.SetStatus(v1alpha1.StatusInProgress)
+
+			Expect(node.Annotations).To(HaveKeyWithValue(statusKey, string(v1alpha1.StatusInProgress)))
+			Expect(node.Labels).To(HaveKeyWithValue(statusKey, string(v1alpha1.StatusInProgress)))
+			Expect(sn.Changed()).To(BeFalse())
+		})
+
+		// The uncordon sits outside the metadata comparison: a node whose status metadata is
+		// already Complete still has to lose the cordon it is holding.
+		It("should uncordon on Complete even when no metadata write was needed", func() {
+			node, sn := newNode(
+				map[string]string{
+					statusKey:                        string(v1alpha1.StatusComplete),
+					cordonAnnotationKey(skyhookName): cordonAnnotationValue,
+				},
+				map[string]string{statusKey: string(v1alpha1.StatusComplete)},
+			)
+			node.Spec.Unschedulable = true
+
+			sn.SetStatus(v1alpha1.StatusComplete)
+
+			Expect(node.Spec.Unschedulable).To(BeFalse())
+			Expect(node.Annotations).ToNot(HaveKey(cordonAnnotationKey(skyhookName)))
+		})
+
+		// A reset removes the annotation and the label in two separate API calls and only
+		// warns when the label call fails, so a surviving label is the wreckage of a reset,
+		// not a status. Reading it back as a fallback would undo the reset.
+		It("should report Unknown when only a stale label survives", func() {
+			_, sn := newNode(nil, map[string]string{statusKey: string(v1alpha1.StatusErroring)})
+
+			Expect(sn.Status()).To(Equal(v1alpha1.StatusUnknown))
+		})
+
+		It("should leave another NodeWright's status metadata alone", func() {
+			otherKey := statusMetadataKey("other-skyhook")
+			node, sn := newNode(
+				map[string]string{otherKey: string(v1alpha1.StatusErroring)},
+				map[string]string{otherKey: string(v1alpha1.StatusErroring)},
+			)
+
+			sn.SetStatus(v1alpha1.StatusComplete)
+
+			Expect(node.Annotations).To(HaveKeyWithValue(otherKey, string(v1alpha1.StatusErroring)))
+			Expect(node.Labels).To(HaveKeyWithValue(otherKey, string(v1alpha1.StatusErroring)))
+		})
+	})
+
+	Context("Cordon", func() {
+		It("should initialize annotations if the node has none", func() {
+			myCordonKey := cordonAnnotationKey("my-skyhook")
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-node",
+				},
+			}
+
+			sn, err := NewSkyhookNodeOnly(node, "my-skyhook")
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(sn.Cordon()).To(BeTrue())
+
+			Expect(node.Spec.Unschedulable).To(BeTrue())
+			Expect(node.Annotations).To(HaveKeyWithValue(myCordonKey, cordonAnnotationValue))
+			Expect(sn.Changed()).To(BeTrue())
+		})
+
+		// The caller uses the return value to decide whether the cordon still needs to
+		// reach the API server before it is safe to start evicting.
+		It("should report no change when the cordon is already recorded", func() {
+			myCordonKey := cordonAnnotationKey("my-skyhook")
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-node",
+					Annotations: map[string]string{
+						myCordonKey: cordonAnnotationValue,
+					},
+				},
+				Spec: corev1.NodeSpec{Unschedulable: true},
+			}
+
+			sn, err := NewSkyhookNodeOnly(node, "my-skyhook")
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(sn.Cordon()).To(BeFalse())
+			Expect(sn.Changed()).To(BeFalse())
+		})
+
+		It("should report a change when another Skyhook already cordoned the node", func() {
+			myCordonKey := cordonAnnotationKey("my-skyhook")
+			otherCordonKey := cordonAnnotationKey("other-skyhook")
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-node",
+					Annotations: map[string]string{
+						otherCordonKey: cordonAnnotationValue,
+					},
+				},
+				Spec: corev1.NodeSpec{Unschedulable: true},
+			}
+
+			sn, err := NewSkyhookNodeOnly(node, "my-skyhook")
+			Expect(err).ToNot(HaveOccurred())
+
+			// Unschedulable is already set, but this Skyhook's ownership annotation is
+			// not persisted yet, and Uncordon keys off that annotation.
+			Expect(sn.Cordon()).To(BeTrue())
+			Expect(node.Annotations).To(HaveKeyWithValue(myCordonKey, cordonAnnotationValue))
+			Expect(sn.Changed()).To(BeTrue())
+		})
+
+		// Another controller (a health checker, a human) cordoned the node. Recording it as
+		// ours would let Uncordon release a cordon we never created.
+		It("should not take ownership of a cordon no Skyhook created", func() {
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+				Spec:       corev1.NodeSpec{Unschedulable: true},
+			}
+
+			sn, err := NewSkyhookNodeOnly(node, "my-skyhook")
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(sn.Cordon()).To(BeFalse())
+			Expect(node.Spec.Unschedulable).To(BeTrue())
+			Expect(node.Annotations).ToNot(HaveKey(cordonAnnotationKey("my-skyhook")))
+			Expect(sn.Changed()).To(BeFalse())
+		})
+
+		// runtimeRequiredCordon is a Skyhook-held cordon, so another Skyhook still records its
+		// own ownership on top of it rather than treating the node as externally cordoned.
+		It("should record ownership on a node held only by the runtimeRequiredCordon", func() {
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-node",
+					Annotations: map[string]string{
+						v1alpha1.RuntimeRequiredCordonAnnotation: cordonAnnotationValue,
+					},
+				},
+				Spec: corev1.NodeSpec{Unschedulable: true},
+			}
+
+			sn, err := NewSkyhookNodeOnly(node, "my-skyhook")
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(sn.Cordon()).To(BeTrue())
+			Expect(node.Annotations).To(HaveKeyWithValue(cordonAnnotationKey("my-skyhook"), cordonAnnotationValue))
+		})
+
+		It("should leave an external cordon in place when the Skyhook completes", func() {
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+				Spec:       corev1.NodeSpec{Unschedulable: true},
+			}
+
+			sn, err := NewSkyhookNodeOnly(node, "my-skyhook")
+			Expect(err).ToNot(HaveOccurred())
+
+			sn.Cordon()
+			sn.SetStatus(v1alpha1.StatusComplete)
+
+			Expect(node.Spec.Unschedulable).To(BeTrue())
+		})
+	})
+
+	Context("Uncordon", func() {
+		myCordonKey := cordonAnnotationKey("my-skyhook")
+		otherCordonKey := cordonAnnotationKey("other-skyhook")
+
+		It("should make the node schedulable if this Skyhook owns the only cordon", func() {
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-node",
+					Annotations: map[string]string{
+						myCordonKey: cordonAnnotationValue,
+					},
+				},
+				Spec: corev1.NodeSpec{Unschedulable: true},
+			}
+
+			sn, err := NewSkyhookNodeOnly(node, "my-skyhook")
+			Expect(err).ToNot(HaveOccurred())
+
+			sn.Uncordon()
+
+			Expect(node.Spec.Unschedulable).To(BeFalse())
+			Expect(node.Annotations).ToNot(HaveKey(myCordonKey))
+			Expect(sn.Changed()).To(BeTrue())
+		})
+
+		It("should keep the node unschedulable if another Skyhook still owns a cordon", func() {
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-node",
+					Annotations: map[string]string{
+						myCordonKey:    cordonAnnotationValue,
+						otherCordonKey: cordonAnnotationValue,
+					},
+				},
+				Spec: corev1.NodeSpec{Unschedulable: true},
+			}
+
+			sn, err := NewSkyhookNodeOnly(node, "my-skyhook")
+			Expect(err).ToNot(HaveOccurred())
+
+			sn.Uncordon()
+
+			Expect(node.Spec.Unschedulable).To(BeTrue())
+			Expect(node.Annotations).ToNot(HaveKey(myCordonKey))
+			Expect(node.Annotations).To(HaveKeyWithValue(otherCordonKey, cordonAnnotationValue))
+			Expect(sn.Changed()).To(BeTrue())
+		})
+
+		It("should make the node schedulable if only unrelated Skyhook annotations remain", func() {
+			otherStatusKey := "nodewright.nvidia.com/status_other-skyhook"
+			otherNodeStateKey := "nodewright.nvidia.com/nodeState_other-skyhook"
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-node",
+					Annotations: map[string]string{
+						myCordonKey:       cordonAnnotationValue,
+						otherStatusKey:    string(v1alpha1.StatusInProgress),
+						otherNodeStateKey: "{}",
+					},
+				},
+				Spec: corev1.NodeSpec{Unschedulable: true},
+			}
+
+			sn, err := NewSkyhookNodeOnly(node, "my-skyhook")
+			Expect(err).ToNot(HaveOccurred())
+
+			sn.Uncordon()
+
+			Expect(node.Spec.Unschedulable).To(BeFalse())
+			Expect(node.Annotations).ToNot(HaveKey(myCordonKey))
+			Expect(node.Annotations).To(HaveKeyWithValue(otherStatusKey, string(v1alpha1.StatusInProgress)))
+			Expect(node.Annotations).To(HaveKeyWithValue(otherNodeStateKey, "{}"))
+			Expect(sn.Changed()).To(BeTrue())
+		})
+
+		It("should keep the node cordoned if the runtimeRequiredCordon annotation is present", func() {
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-node",
+					Annotations: map[string]string{
+						myCordonKey:                              cordonAnnotationValue,
+						v1alpha1.RuntimeRequiredCordonAnnotation: cordonAnnotationValue,
+					},
+				},
+				Spec: corev1.NodeSpec{Unschedulable: true},
+			}
+
+			sn, err := NewSkyhookNodeOnly(node, "my-skyhook")
+			Expect(err).ToNot(HaveOccurred())
+
+			sn.Uncordon()
+
+			Expect(node.Spec.Unschedulable).To(BeTrue())
+			Expect(node.Annotations).ToNot(HaveKey(myCordonKey))
+			Expect(node.Annotations).To(HaveKeyWithValue(v1alpha1.RuntimeRequiredCordonAnnotation, cordonAnnotationValue))
+			Expect(sn.Changed()).To(BeTrue())
+		})
+
+		It("should not change the node if this Skyhook does not own a cordon", func() {
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-node",
+					Annotations: map[string]string{
+						otherCordonKey: cordonAnnotationValue,
+					},
+				},
+				Spec: corev1.NodeSpec{Unschedulable: true},
+			}
+
+			sn, err := NewSkyhookNodeOnly(node, "my-skyhook")
+			Expect(err).ToNot(HaveOccurred())
+
+			sn.Uncordon()
+
+			Expect(node.Spec.Unschedulable).To(BeTrue())
+			Expect(node.Annotations).To(HaveKeyWithValue(otherCordonKey, cordonAnnotationValue))
+			Expect(sn.Changed()).To(BeFalse())
+		})
+	})
+
+	Context("DrainStart", func() {
+		It("should record, read, and clear the drain start annotation", func() {
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-node",
+				},
+			}
+
+			sn, err := NewSkyhookNode(node, &v1alpha1.NodeWright{
+				ObjectMeta: metav1.ObjectMeta{Name: "my-skyhook"},
+				Spec:       v1alpha1.NodeWrightSpec{Packages: v1alpha1.Packages{}},
+			})
+			Expect(err).ToNot(HaveOccurred())
+
+			started := metav1.NewTime(time.Date(2026, time.June, 2, 13, 14, 15, 0, time.UTC))
+			sn.StartDrain(started)
+
+			Expect(node.Annotations).To(HaveKeyWithValue("nodewright.nvidia.com/drainStart_my-skyhook", "2026-06-02T13:14:15Z"))
+			Expect(sn.Changed()).To(BeTrue())
+
+			drainStartedAt, err := sn.DrainStartedAt()
+			Expect(err).ToNot(HaveOccurred())
+			Expect(drainStartedAt).To(Equal(&started))
+
+			sn.ClearDrainStart()
+			Expect(node.Annotations).ToNot(HaveKey("nodewright.nvidia.com/drainStart_my-skyhook"))
+		})
+
+		It("should return an error for a malformed drain start annotation", func() {
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-node",
+					Annotations: map[string]string{
+						"nodewright.nvidia.com/drainStart_my-skyhook": "not-a-time",
+					},
+				},
+			}
+
+			sn, err := NewSkyhookNode(node, &v1alpha1.NodeWright{
+				ObjectMeta: metav1.ObjectMeta{Name: "my-skyhook"},
+				Spec:       v1alpha1.NodeWrightSpec{Packages: v1alpha1.Packages{}},
+			})
+			Expect(err).ToNot(HaveOccurred())
+
+			drainStartedAt, err := sn.DrainStartedAt()
+			Expect(err).To(HaveOccurred())
+			Expect(drainStartedAt).To(BeNil())
+		})
+	})
+
+	Context("SetDrainBlocked", func() {
+		const drainBlockedKey = "nodewright.nvidia.com/drainBlocked_my-skyhook"
+		skyhook := &v1alpha1.NodeWright{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-skyhook"},
+			Spec:       v1alpha1.NodeWrightSpec{Packages: v1alpha1.Packages{}},
+		}
+		blockers := []drain.BlockedPod{
+			{Namespace: "default", Name: "web-1", Reason: drain.BlockReasonPodDisruptionBudget, Detail: "The disruption budget web-pdb needs 3 healthy pods and has 3 currently"},
+			{Namespace: "batch", Name: "scratch", Reason: drain.BlockReasonUnmanagedPod},
+			{Namespace: "default", Name: "web-0", Reason: drain.BlockReasonPodDisruptionBudget, Detail: "The disruption budget web-pdb needs 3 healthy pods and has 3 currently"},
+			{Namespace: "batch", Name: "scratch", Reason: drain.BlockReasonEmptyDirData},
+			{Namespace: "default", Name: "web-0", Reason: drain.BlockReasonPodDisruptionBudget, Detail: "The disruption budget canary-pdb needs 1 healthy pods and has 1 currently"},
+		}
+
+		// DrainNode hands blockers over in informer order, which varies between passes.
+		// Any order-dependence in the stored value re-patches the Node on a pass where
+		// nothing changed. The entries sharing a namespace and name pin the reason and
+		// detail tie-breaks, so the value is canonical for any input.
+		It("stores the same blockers identically whatever order they arrive in", func() {
+			reversed := slices.Clone(blockers)
+			slices.Reverse(reversed)
+			rotated := append(slices.Clone(blockers[2:]), blockers[:2]...)
+
+			valueFor := func(blocked []drain.BlockedPod) string {
+				GinkgoHelper()
+				node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "test-node"}}
+				sn, err := NewSkyhookNode(node, skyhook)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(sn.SetDrainBlocked(blocked)).To(Succeed())
+				Expect(sn.Changed()).To(BeTrue())
+				return node.Annotations[drainBlockedKey]
+			}
+
+			stored := valueFor(blockers)
+			Expect(stored).ToNot(BeEmpty())
+			Expect(valueFor(reversed)).To(Equal(stored))
+
+			// A later pass: a fresh wrapper over the Node as persisted, handed yet another order.
+			node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+				Name:        "test-node",
+				Annotations: map[string]string{drainBlockedKey: stored},
+			}}
+			sn, err := NewSkyhookNode(node, skyhook)
+			Expect(err).ToNot(HaveOccurred())
+			callerOrder := slices.Clone(rotated)
+
+			Expect(sn.SetDrainBlocked(rotated)).To(Succeed())
+
+			Expect(sn.Changed()).To(BeFalse())
+			Expect(node.Annotations).To(HaveKeyWithValue(drainBlockedKey, stored))
+			Expect(rotated).To(Equal(callerOrder), "SetDrainBlocked must not reorder the caller's slice")
+		})
+
+		It("reads the blockers back through DrainBlocked in the canonical order", func() {
+			node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "test-node"}}
+			sn, err := NewSkyhookNode(node, skyhook)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(sn.SetDrainBlocked(blockers)).To(Succeed())
+
+			blocked, err := sn.DrainBlocked()
+
+			Expect(err).ToNot(HaveOccurred())
+			// By namespace, then name, then reason, then detail.
+			Expect(blocked).To(Equal([]drain.BlockedPod{blockers[3], blockers[1], blockers[4], blockers[2], blockers[0]}))
+		})
+
+		DescribeTable("clears the annotation for nil or empty blockers",
+			func(blocked []drain.BlockedPod, annotations map[string]string, wantChanged bool) {
+				node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "test-node", Annotations: maps.Clone(annotations)}}
+				sn, err := NewSkyhookNode(node, skyhook)
+				Expect(err).ToNot(HaveOccurred())
+
+				Expect(sn.SetDrainBlocked(blocked)).To(Succeed())
+
+				Expect(sn.Changed()).To(Equal(wantChanged))
+				others := maps.Clone(annotations)
+				delete(others, drainBlockedKey)
+				Expect(node.Annotations).To(Equal(others))
+				stored, err := sn.DrainBlocked()
+				Expect(err).ToNot(HaveOccurred())
+				Expect(stored).To(BeNil())
+			},
+			Entry("nil over recorded blockers", nil,
+				map[string]string{drainBlockedKey: `[{"namespace":"batch","name":"scratch","reason":"UnmanagedPod"}]`, "unrelated": "kept"}, true),
+			Entry("empty over recorded blockers", []drain.BlockedPod{},
+				map[string]string{drainBlockedKey: `[{"namespace":"batch","name":"scratch","reason":"UnmanagedPod"}]`, "unrelated": "kept"}, true),
+			Entry("nil with none recorded", nil, map[string]string{"unrelated": "kept"}, false),
+			Entry("empty on a node without annotations", []drain.BlockedPod{}, nil, false),
+		)
+
+		It("marks the node updated only when the recorded blockers change", func() {
+			node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "test-node"}}
+			first, err := NewSkyhookNode(node, skyhook)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(first.SetDrainBlocked(blockers)).To(Succeed())
+
+			// A later pass: a fresh wrapper over the Node as persisted.
+			sn, err := NewSkyhookNode(node, skyhook)
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(sn.SetDrainBlocked(slices.Clone(blockers))).To(Succeed())
+			Expect(sn.Changed()).To(BeFalse(), "the same blockers are not a change")
+
+			changed := slices.Clone(blockers)
+			changed[0].Detail = "The disruption budget web-pdb needs 3 healthy pods and has 2 currently"
+			Expect(sn.SetDrainBlocked(changed)).To(Succeed())
+			Expect(sn.Changed()).To(BeTrue(), "a new detail is a change")
+			stored, err := sn.DrainBlocked()
+			Expect(err).ToNot(HaveOccurred())
+			Expect(stored).To(ContainElement(changed[0]))
+		})
+
+		It("returns an error from DrainBlocked for a malformed annotation", func() {
+			node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+				Name:        "test-node",
+				Annotations: map[string]string{drainBlockedKey: "not-json"},
+			}}
+			sn, err := NewSkyhookNode(node, skyhook)
+			Expect(err).ToNot(HaveOccurred())
+
+			blocked, err := sn.DrainBlocked()
+
+			Expect(err).To(HaveOccurred())
+			Expect(blocked).To(BeNil())
+		})
+	})
+
+	Context("Reset", func() {
+		It("should remove drain start and other node metadata for the skyhook", func() {
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-node",
+					Annotations: map[string]string{
+						"nodewright.nvidia.com/cordon_my-skyhook":     "true",
+						"nodewright.nvidia.com/drainStart_my-skyhook": "2026-06-02T13:14:15Z",
+						"nodewright.nvidia.com/nodeState_my-skyhook":  "{}",
+						"nodewright.nvidia.com/status_my-skyhook":     "erroring",
+						"nodewright.nvidia.com/version_my-skyhook":    "1.0.0",
+					},
+					Labels: map[string]string{
+						"nodewright.nvidia.com/status_my-skyhook": "erroring",
+					},
+				},
+			}
+			skyhook := &v1alpha1.NodeWright{
+				ObjectMeta: metav1.ObjectMeta{Name: "my-skyhook"},
+				Spec:       v1alpha1.NodeWrightSpec{Packages: v1alpha1.Packages{}},
+				Status: v1alpha1.NodeWrightStatus{
+					NodeState:  map[string]v1alpha1.NodeState{"test-node": {}},
+					NodeStatus: map[string]v1alpha1.Status{"test-node": v1alpha1.StatusErroring},
+				},
+			}
+
+			sn, err := NewSkyhookNode(node, skyhook)
+			Expect(err).ToNot(HaveOccurred())
+
+			sn.Reset()
+
+			Expect(node.Annotations).ToNot(HaveKey("nodewright.nvidia.com/drainStart_my-skyhook"))
+			Expect(node.Annotations).ToNot(HaveKey("nodewright.nvidia.com/nodeState_my-skyhook"))
+			Expect(node.Annotations).ToNot(HaveKey("nodewright.nvidia.com/status_my-skyhook"))
+			Expect(node.Annotations).ToNot(HaveKey("nodewright.nvidia.com/version_my-skyhook"))
+			Expect(node.Labels).ToNot(HaveKey("nodewright.nvidia.com/status_my-skyhook"))
+			Expect(skyhook.Status.NodeState).ToNot(HaveKey("test-node"))
+			Expect(skyhook.Status.NodeStatus).ToNot(HaveKey("test-node"))
+			Expect(skyhook.Status.Status).To(Equal(v1alpha1.StatusUnknown))
+		})
+
+		// Reset runs on reboot detection, and a Skyhook's own reboot interrupt is a reboot. The
+		// node is still cordoned at that point, so dropping the annotation would leave a cordon
+		// no Skyhook holds, which Cordon then refuses to take and Uncordon never releases.
+		DescribeTable("should keep this Skyhook's cordon so the reapply releases it on completion",
+			func(reappliesInterrupt bool) {
+				node := &corev1.Node{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "test-node",
+						Annotations: map[string]string{
+							"nodewright.nvidia.com/cordon_my-skyhook": "true",
+						},
+					},
+					Spec: corev1.NodeSpec{Unschedulable: true},
+				}
+				skyhook := &v1alpha1.NodeWright{
+					ObjectMeta: metav1.ObjectMeta{Name: "my-skyhook"},
+					Spec:       v1alpha1.NodeWrightSpec{Packages: v1alpha1.Packages{}},
+				}
+
+				sn, err := NewSkyhookNode(node, skyhook)
+				Expect(err).ToNot(HaveOccurred())
+
+				sn.Reset()
+				Expect(node.Annotations).To(HaveKeyWithValue("nodewright.nvidia.com/cordon_my-skyhook", "true"))
+
+				if reappliesInterrupt {
+					sn.Cordon()
+				}
+				sn.SetStatus(v1alpha1.StatusComplete)
+
+				Expect(node.Spec.Unschedulable).To(BeFalse())
+			},
+			Entry("when the reapply runs an interrupt", true),
+			// Completion reaches Uncordon without Cordon ever running, so only the kept
+			// annotation lets it release the cordon.
+			Entry("when the reapply has no interrupt package", false),
+		)
+	})
+
+	Context("CleanupSCRMetadata", func() {
+		It("should remove matching keys and preserve others", func() {
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-node",
+					Annotations: map[string]string{
+						"nodewright.nvidia.com/status_my-skyhook":    "complete",
+						"nodewright.nvidia.com/nodeState_my-skyhook": "{}",
+						"nodewright.nvidia.com/version_my-skyhook":   "1.0.0",
+						"nodewright.nvidia.com/status_other-skyhook": "complete", // different skyhook
+						"unrelated-annotation":                       "keep-me",
+					},
+					Labels: map[string]string{
+						"nodewright.nvidia.com/status_my-skyhook":    "complete",
+						"nodewright.nvidia.com/status_other-skyhook": "in_progress", // different skyhook
+						"unrelated-label": "keep-me",
+					},
+				},
+				Status: corev1.NodeStatus{
+					Conditions: []corev1.NodeCondition{
+						{Type: "nodewright.nvidia.com/my-skyhook/NotReady", Status: "False"},
+						{Type: "nodewright.nvidia.com/my-skyhook/Erroring", Status: "False"},
+						{Type: "nodewright.nvidia.com/other-skyhook/NotReady", Status: "True"}, // different skyhook
+						{Type: "Ready", Status: "True"},                                        // system condition
+					},
+				},
+			}
+
+			sn, err := NewSkyhookNode(node, &v1alpha1.NodeWright{
+				ObjectMeta: metav1.ObjectMeta{Name: "my-skyhook"},
+				Spec:       v1alpha1.NodeWrightSpec{Packages: v1alpha1.Packages{}},
+			})
+			Expect(err).ToNot(HaveOccurred())
+
+			sn.CleanupSCRMetadata()
+
+			// my-skyhook keys removed
+			Expect(node.Annotations).ToNot(HaveKey("nodewright.nvidia.com/status_my-skyhook"))
+			Expect(node.Annotations).ToNot(HaveKey("nodewright.nvidia.com/nodeState_my-skyhook"))
+			Expect(node.Annotations).ToNot(HaveKey("nodewright.nvidia.com/version_my-skyhook"))
+			Expect(node.Labels).ToNot(HaveKey("nodewright.nvidia.com/status_my-skyhook"))
+
+			// other-skyhook keys preserved
+			Expect(node.Annotations).To(HaveKey("nodewright.nvidia.com/status_other-skyhook"))
+			Expect(node.Labels).To(HaveKey("nodewright.nvidia.com/status_other-skyhook"))
+
+			// unrelated keys preserved
+			Expect(node.Annotations).To(HaveKey("unrelated-annotation"))
+			Expect(node.Labels).To(HaveKey("unrelated-label"))
+
+			// my-skyhook conditions removed, others preserved
+			Expect(node.Status.Conditions).To(HaveLen(2))
+			types := []string{}
+			for _, c := range node.Status.Conditions {
+				types = append(types, string(c.Type))
+			}
+			Expect(types).To(ContainElement("nodewright.nvidia.com/other-skyhook/NotReady"))
+			Expect(types).To(ContainElement("Ready"))
+		})
+
+		It("should preserve nodeState and version annotations when state still has packages", func() {
+			// D2 semantics: non-absent entry means files remain on host. The
+			// finalizer's Phase 3 cleanup must not erase that record when a
+			// package (e.g. uninstall.enabled=false) was never uninstalled.
+			nodeState := `{"leftover|1.0":{"name":"leftover","version":"1.0","state":"complete","stage":"config","image":"img","restarts":0}}`
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-node",
+					Annotations: map[string]string{
+						"nodewright.nvidia.com/status_my-skyhook":    "complete",
+						"nodewright.nvidia.com/nodeState_my-skyhook": nodeState,
+						"nodewright.nvidia.com/version_my-skyhook":   "1.0.0",
+					},
+					Labels: map[string]string{
+						"nodewright.nvidia.com/status_my-skyhook": "complete",
+					},
+				},
+				Status: corev1.NodeStatus{
+					Conditions: []corev1.NodeCondition{
+						{Type: "nodewright.nvidia.com/my-skyhook/NotReady", Status: "False"},
+					},
+				},
+			}
+
+			sn, err := NewSkyhookNode(node, &v1alpha1.NodeWright{
+				ObjectMeta: metav1.ObjectMeta{Name: "my-skyhook"},
+				Spec:       v1alpha1.NodeWrightSpec{Packages: v1alpha1.Packages{}},
+			})
+			Expect(err).ToNot(HaveOccurred())
+
+			sn.CleanupSCRMetadata()
+
+			// nodeState and version preserved because state is non-empty
+			Expect(node.Annotations).To(HaveKeyWithValue("nodewright.nvidia.com/nodeState_my-skyhook", nodeState))
+			Expect(node.Annotations).To(HaveKeyWithValue("nodewright.nvidia.com/version_my-skyhook", "1.0.0"))
+
+			// status annotation, label, and condition still cleaned up
+			Expect(node.Annotations).ToNot(HaveKey("nodewright.nvidia.com/status_my-skyhook"))
+			Expect(node.Labels).ToNot(HaveKey("nodewright.nvidia.com/status_my-skyhook"))
+			Expect(node.Status.Conditions).To(BeEmpty())
+		})
+	})
+
+	Context("ProgressSkipped", func() {
+		It("persists the skipped->complete promotion to the nodeState annotation", func() {
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+			}
+			skyhook := v1alpha1.NodeWright{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-skyhook"},
+				Spec: v1alpha1.NodeWrightSpec{
+					Packages: map[string]v1alpha1.Package{
+						"baxter": {
+							PackageRef: v1alpha1.PackageRef{Name: "baxter", Version: "3.2.1"},
+							Image:      "baxter-image",
+						},
+					},
+				},
+			}
+
+			sn, err := NewSkyhookNode(node, &skyhook)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Park baxter at interrupt/skipped. Upsert persists this to the annotation.
+			Expect(sn.Upsert(v1alpha1.PackageRef{Name: "baxter", Version: "3.2.1"}, "baxter-image",
+				v1alpha1.StateSkipped, v1alpha1.StageInterrupt, 0, "")).To(Succeed())
+
+			Expect(sn.ProgressSkipped()).To(Succeed())
+
+			// The promotion must be persisted to the nodeState annotation, not just the
+			// in-memory map: the reconcile is level-triggered and reloads state from the
+			// annotation each pass. A fresh wrapper over the same Node models that reload.
+			reloaded, err := NewSkyhookNode(node, &skyhook)
+			Expect(err).NotTo(HaveOccurred())
+			status, found := reloaded.PackageStatus("baxter|3.2.1")
+			Expect(found).To(BeTrue())
+			Expect(status.State).To(Equal(v1alpha1.StateComplete))
+		})
+	})
+
+	Context("Taint and RemoveTaint", func() {
+		const taintKey = "nodewright.nvidia.com/runtime-required"
+
+		newNode := func(taints ...corev1.Taint) SkyhookNode {
+			GinkgoHelper()
+			node := &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+				Spec:       corev1.NodeSpec{Taints: taints},
+			}
+			skyhook := v1alpha1.NodeWright{ObjectMeta: metav1.ObjectMeta{Name: "test-skyhook"}}
+
+			sn, err := NewSkyhookNode(node, &skyhook)
+			Expect(err).NotTo(HaveOccurred())
+			return sn
+		}
+
+		It("should add a NoSchedule taint valued with the Skyhook name", func() {
+			sn := newNode()
+
+			sn.Taint(taintKey)
+
+			Expect(sn.GetNode().Spec.Taints).To(ConsistOf(corev1.Taint{
+				Key:    taintKey,
+				Value:  "test-skyhook",
+				Effect: corev1.TaintEffectNoSchedule,
+			}))
+			Expect(sn.Changed()).To(BeTrue())
+		})
+
+		It("should keep taints set by others when adding", func() {
+			existing := corev1.Taint{Key: "other/taint", Value: "keep", Effect: corev1.TaintEffectNoExecute}
+			sn := newNode(existing)
+
+			sn.Taint(taintKey)
+
+			Expect(sn.GetNode().Spec.Taints).To(HaveLen(2))
+			Expect(sn.GetNode().Spec.Taints).To(ContainElement(existing))
+		})
+
+		// Re-tainting is not an error the operator can afford: reconcile is level-triggered
+		// and will call Taint on every pass, and a duplicate key is rejected by the apiserver.
+		It("should be a no-op when the taint key is already present", func() {
+			sn := newNode(corev1.Taint{Key: taintKey, Value: "someone-else", Effect: corev1.TaintEffectNoSchedule})
+
+			sn.Taint(taintKey)
+
+			Expect(sn.GetNode().Spec.Taints).To(HaveLen(1))
+			Expect(sn.GetNode().Spec.Taints[0].Value).To(Equal("someone-else"))
+			Expect(sn.Changed()).To(BeFalse())
+		})
+
+		It("should remove only the taint with the given key", func() {
+			other := corev1.Taint{Key: "other/taint", Value: "keep", Effect: corev1.TaintEffectNoExecute}
+			sn := newNode(
+				corev1.Taint{Key: taintKey, Value: "test-skyhook", Effect: corev1.TaintEffectNoSchedule},
+				other,
+			)
+
+			sn.RemoveTaint(taintKey)
+
+			Expect(sn.GetNode().Spec.Taints).To(ConsistOf(other))
+			Expect(sn.Changed()).To(BeTrue())
+		})
+
+		It("should be a no-op when the node carries no taints", func() {
+			sn := newNode()
+
+			sn.RemoveTaint(taintKey)
+
+			Expect(sn.GetNode().Spec.Taints).To(BeEmpty())
+			Expect(sn.Changed()).To(BeFalse())
+		})
+
+		It("should be a no-op when the taint key is absent", func() {
+			other := corev1.Taint{Key: "other/taint", Value: "keep", Effect: corev1.TaintEffectNoExecute}
+			sn := newNode(other)
+
+			sn.RemoveTaint(taintKey)
+
+			Expect(sn.GetNode().Spec.Taints).To(ConsistOf(other))
+			Expect(sn.Changed()).To(BeFalse())
+		})
+
+		It("should round-trip an add followed by a remove", func() {
+			sn := newNode()
+
+			sn.Taint(taintKey)
+			sn.RemoveTaint(taintKey)
+
+			Expect(sn.GetNode().Spec.Taints).To(BeEmpty())
+		})
+	})
+})

@@ -1,0 +1,113 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Build and push agentless container image
+
+# Configures this workflow to run every time a tag is created
+on:
+  # Pull requests run this from merge-gate.yaml, whose `agentless` path filter
+  # mirrors the push paths below, plus merge-gate.yaml itself.
+  workflow_call: {}
+  push:
+    branches: 
+      - main
+    paths:
+      - containers/agentless/**
+      - .github/workflows/agentless-container.yaml
+      - .github/actions/setup-docker-hub-mirror/**
+
+permissions:
+  contents: read
+
+# NOTE: we may want to switch to matrix build for multi-platform support if this is taking too long
+# https://docs.docker.com/build/ci/github-actions/multi-platform/#distribute-build-across-multiple-runners
+
+
+# Defines two custom environment variables for the workflow. These are used for the Container registry domain, and a name for the Docker image that this workflow builds.
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  DOCKER_CMD: docker
+  # Opt all JS actions into Node 24 ahead of GitHub's Node 20 phase-out.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-and-publish-agentless:
+    runs-on: ubuntu-latest
+    # Sets the permissions granted to the `GITHUB_TOKEN` for the actions in this job.
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      # Uses the `docker/login-action` action to log in to the Container registry using the account and password that will publish the packages. Once published, the packages are scoped to the account defined here.
+      - name: Log in to the Container registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Route Docker Hub pulls through mirror.gcr.io
+        id: docker-hub-mirror
+        uses: ./.github/actions/setup-docker-hub-mirror
+        with:
+          qemu: "true"
+
+      # Setup for multi-platform
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          image: ${{ steps.docker-hub-mirror.outputs.binfmt-image }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver-opts: ${{ steps.docker-hub-mirror.outputs.buildx-driver-opts }}
+          buildkitd-config: ${{ steps.docker-hub-mirror.outputs.buildkitd-config }}
+
+      - name: Build the agent container image
+        id: build
+        run: |
+          source ./containers/agentless/versions.sh
+          cd agent
+          export TAGS=()
+          for version in $TEST_VERSIONS; do
+            TAGS+="-t ${{ env.REGISTRY }}/${{env.IMAGE_NAME}}/agentless:$version "
+          done
+          TAGS=$(echo $TAGS | tr '[:upper:]' '[:lower:]')
+          echo "======== Tags: ========\n $TAGS"
+          # GITHUB_BASE_REF is only set when the action source event is a pull request.
+          # in that case don't push.
+          export PUSH=$(if [ ${{ github.event_name }} != 'pull_request' ]; then echo "--push"; else echo ""; fi)
+          
+          docker buildx build $PUSH --platform linux/amd64,linux/arm64 $TAGS --metadata-file=metadata.json -f ../containers/agentless/Dockerfile ../containers/agentless
+
+          cat metadata.json
+          echo "digest=$(cat metadata.json | jq -r .\"containerimage.digest\")" >> $GITHUB_OUTPUT
+          cat $GITHUB_OUTPUT
+      
+      # This step generates an artifact attestation for the image, which is an unforgeable statement about where and how it was built. It increases supply chain security for people who consume the image. For more information, see [AUTOTITLE](/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds).
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v4
+        if: ${{ github.event_name != 'pull_request' }}
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{env.IMAGE_NAME}}/agentless
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true

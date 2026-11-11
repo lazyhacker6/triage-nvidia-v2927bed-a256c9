@@ -1,0 +1,83 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# yaml-language-server: $schema=https://raw.githubusercontent.com/kyverno/chainsaw/main/.schemas/json/test-chainsaw-v1alpha1.json
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: helm-chart
+spec:
+  concurrent: false
+  timeouts:
+    assert: 240s
+    exec: 240s
+  steps:
+  - name: reset-state
+    try:
+    - script:
+        timeout: 30s
+        content: |
+          ../nodewright-cli reset helm-test-skyhook --confirm 2>/dev/null || true
+          echo "✓ State reset complete"
+  
+  - try:
+    - script:
+        content: |
+          ## Add not good taint to nodes
+          ../taint-nodes.sh dedicated=bogus:NoSchedule
+    - script:
+        content: |
+          ## Install helm chart
+          ../install-helm-chart.sh foobar
+    - assert:
+        file: assert-no-schedule.yaml
+    - script:
+        content: |
+          ## remove not good taint and add good taint on nodes
+          ../untaint-nodes.sh dedicated=bogus:NoSchedule
+          ../taint-nodes.sh dedicated=system-cpu:NoSchedule
+    - script:
+        content: |
+          # reinstall helm chart
+          ../uninstall-helm-chart.sh foobar
+          ../install-helm-chart.sh foobar
+    - assert:
+        file: assert-scheduled.yaml
+    - apply:
+        file: deployment-policy.yaml
+    - apply:
+        file: nodewright.yaml
+    - assert:
+        file: assert-nodewright-complete.yaml
+    - script:
+        content: |
+          ## Remove helm chart (pre-delete hook should clean up Skyhooks/DeploymentPolicies)
+          ## If cleanup fails or times out, helm uninstall will fail
+          ../uninstall-helm-chart.sh foobar
+    finally:
+    - script:
+        content: |
+          ## Cleanup any remaining resources
+          ../nodewright-cli reset helm-test-skyhook --confirm 2>/dev/null || true
+    - script:
+        content: |
+          ## Remove taint from nodes
+          ../untaint-nodes.sh dedicated=bogus:NoSchedule
+          ../untaint-nodes.sh dedicated=system-cpu:NoSchedule
+    - script:
+        content: |
+          ## Remove helm chart if still present
+          ../uninstall-helm-chart.sh foobar || true

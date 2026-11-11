@@ -1,0 +1,142 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Working state for the `nodewright-managing-openvex` skill. Read at the start
+# of every invocation, updated at the end of every invocation.
+#
+# THE LIFECYCLE IS THE ENTIRE POINT OF THIS FILE. Entries are written so they
+# can be deleted, and deleting them is the job, not an optional tidy-up. State
+# that is never removed is exactly what turned a sibling project's document-level
+# `tooling` field into 8,010 bytes of accumulated prose that then shipped,
+# signed, on seven release images (NVIDIA/aicr#2706). This file exists so that
+# never has to live in `.openvex.json`; it only works if entries leave.
+#
+# THE RULE: every entry must say what would invalidate it. An entry that cannot
+# state that is not state. It is prose, and it belongs in a PR description or
+# nowhere.
+#
+# Three kinds of entry, each with its own deletion rule:
+#
+#   deferred_verifications
+#     A check that could not complete in the session that wrote it because it
+#     needs a later CI run or a later release. `resolves_when` must name the
+#     OUTCOME, never the event that merely makes the check runnable. "The
+#     release published" is not a result; "the HIGH+ count dropped by the
+#     number of findings the statement covers" is.
+#     DELETE once the check has been run AND passed. A failed check is not a
+#     resolution; it is the finding you are now triaging, and it belongs in an
+#     issue rather than here.
+#
+#   known_negatives
+#     Work already done that came back negative, recorded so nobody repeats it.
+#     Carries `invalidated_by`: the upstream event that makes the negative worth
+#     rechecking.
+#     DELETE when `invalidated_by` fires. Do not rewrite it as history; the
+#     recheck's result is the new entry, if one is needed at all.
+#
+#   deliberate_exclusions
+#     A decision not to act, recorded so the next maintainer does not silently
+#     reverse it. Carries `invalidated_by`: the condition under which the
+#     decision should be revisited.
+#     DELETE when that condition changes. The decision is then live again and
+#     gets made afresh, not inherited.
+
+deferred_verifications:
+  - id: go-2026-6604-agent-alert-closes-in-ci
+    opened: 2026-11-04
+    what: >-
+      The GO-2026-6604 statement was measured locally against agent:latest
+      (v7.0.0, sha256:2436e12e...): HIGH+ 1 -> 0 on linux/amd64 and
+      linux/arm64. The workflow's own `vex:` input path has not run it yet.
+    resolves_when: >-
+      An Image Vulnerability Scan that files agent:latest (still the v7.0.0
+      index measured above, which reports the finding without the statement)
+      under release/agent/v7.0.x has no open GO-2026-6604-stdlib alert on that
+      branch in grype-agent or grype-agent-arm64. Alert #175 closing on main is
+      not the check: main is scanned from the main-built agent, whose newer Go
+      toolchain already carries the fix.
+  - id: agent-v7.0.0-reattest-reaches-nspect
+    opened: 2026-11-06
+    what: >-
+      Statements for all 18 findings nSpect lists against agent v7.0.0 (stdlib
+      go1.27.1, golang.org/x/text v0.38.0) were added to .openvex.json (#999).
+      v7.0.0's release attestation carries only GO-2026-5970, so the rest
+      reach nSpect only through a vex-reattest.yaml run for agent/v7.0.0 on
+      release/agent/v7.0.x, which has not happened yet. The run replaces the
+      release's OpenVEX attestation (sha256:0c57b028... on linux/amd64,
+      sha256:d63857a8... on linux/arm64, on GHCR and NGC staging). Three steps
+      have not been exercised: rewriting GHCR's sha256-<hex> referrers fallback
+      index with scripts/oci-drop-referrers.sh, deleting the package versions
+      with the workflow token, and `oras manifest delete` by digest on nvcr.io,
+      which serves the referrers API natively (no fallback index).
+    resolves_when: >-
+      That run succeeds with both deletes, `scripts/openvex-referrers.sh`
+      lists only the new attestation per platform on GHCR and NGC staging, and
+      nSpect's vulnerability list for agent v7.0.0 shows all 18 findings as
+      source-managed OCI VEX, with none "Missing from OCI VEX".
+
+known_negatives:
+  - id: grype-reports-only-go-2026-6604-on-agent-v7.0.0
+    opened: 2026-11-06
+    what: >-
+      grype 0.121.0 (database built 2026-11-05) reports only GO-2026-6604
+      against agent v7.0.0 on either platform, while nSpect reports 18 findings
+      for the same image. The other 17 statements therefore cannot be measured
+      by grype's HIGH+ count; they exist for nSpect, which matches by Go
+      advisory ID and the stdlib or x/text version.
+    invalidated_by: >-
+      grype starts reporting any of GO-2026-5970, 6599-6603, 6605, 6607-6613,
+      6617, 6629 or 6809 against agent v7.0.0. Measure the statement then.
+  - id: govulncheck-binary-mode-on-stripped-agent
+    opened: 2026-11-06
+    what: >-
+      `govulncheck -mode=binary` on the published agent binary reports every
+      advisory's symbols as found, because the binary is stripped (no symbol
+      table) and the tool falls back to assuming everything is present. It
+      reported 15 "affected" for v7.0.0 where source mode on ./cmd/agent
+      (GOOS=linux, Go 1.27.1) reports one, the Windows-only GO-2026-6604. Use
+      source mode on the main package, not binary mode, to decide reachability.
+    invalidated_by: >-
+      The agent is built with a symbol table (no -s/-w in its ldflags).
+
+deliberate_exclusions:
+  - id: agent-x-text-v0.38.0-kept-for-v7.0.0
+    opened: 2026-10-05
+    what: >-
+      The agent ships golang.org/x/text v0.38.0 (GO-2026-5970 /
+      CVE-2026-56852) on release/agent/v7.0.x on purpose, covered by a
+      not_affected statement rather than by the v0.39.0 bump. It gives a
+      downstream consumer a real finding with a signed VEX statement attached
+      to the image, to test that its OCI-referrer VEX ingestion suppresses it.
+      Do not backport an x/text bump to release/agent/v7.0.x while this holds.
+    invalidated_by: >-
+      The downstream ingestion test is complete, or the agent starts importing
+      golang.org/x/text/unicode/norm (which makes the statement false). Then
+      bump x/text and let the versioned subcomponent purl expire the statement.
+  - id: agent-v7.0.x-go-1.27.1-covered-by-statements
+    opened: 2026-11-06
+    what: >-
+      release/agent/v7.0.x stays on Go 1.27.1. Its standard-library findings
+      (GO-2026-6599-6605, 6607-6613, 6617, 6809) are covered by not_affected
+      statements pinned to pkg:golang/stdlib@1.27.1 rather than by a Go bump,
+      because none of the vulnerable packages (net/http and its HTTP/2 code,
+      crypto/tls, crypto/x509, html/template, mime/multipart, net/textproto) is
+      linked into ./cmd/agent, cmd/go is not shipped, and GO-2026-6604 is
+      Windows-only. main already builds the agent with Go 1.27.3, where the
+      pinned statements stop matching.
+    invalidated_by: >-
+      A change on release/agent/v7.0.x that links any of those packages into
+      ./cmd/agent (recheck with `go list -deps ./cmd/agent` at GOOS=linux), or
+      the branch's Go version moving off 1.27.1.

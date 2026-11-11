@@ -1,0 +1,112 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# yaml-language-server: $schema=https://raw.githubusercontent.com/kyverno/chainsaw/main/.schemas/json/test-chainsaw-v1alpha1.json
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: cli-node
+spec:
+  timeouts:
+    assert: 120s
+    exec: 90s
+  steps:
+  # Step 0: Reset state from previous runs
+  - name: reset-state
+    try:
+    - script:
+        timeout: 30s
+        content: |
+          ../nodewright-cli reset cli-node-test --confirm 2>/dev/null || true
+          echo "✓ State reset complete"
+
+  # Step 1: Create a Skyhook
+  - name: setup-skyhook
+    try:
+    - apply:
+        file: nodewright.yaml
+
+  # Step 2: Test node list (table format)
+  - name: test-node-list
+    try:
+    - script:
+        timeout: 30s
+        content: |
+          ../nodewright-cli node list --nodewright cli-node-test
+    - script:
+        timeout: 30s
+        content: |
+          ../nodewright-cli node list --nodewright cli-node-test -o json
+
+  # Step 3: Test node status
+  - name: test-node-status
+    try:
+    - script:
+        timeout: 30s
+        content: |
+          NODE=$(kubectl get nodes -l nodewright.nvidia.com/test-node=skyhooke2e -o jsonpath='{.items[0].metadata.name}')
+          ../nodewright-cli node status "$NODE"
+    - script:
+        timeout: 30s
+        content: |
+          NODE=$(kubectl get nodes -l nodewright.nvidia.com/test-node=skyhooke2e -o jsonpath='{.items[0].metadata.name}')
+          ../nodewright-cli node status "$NODE" --nodewright cli-node-test
+    - script:
+        timeout: 30s
+        content: |
+          NODE=$(kubectl get nodes -l nodewright.nvidia.com/test-node=skyhooke2e -o jsonpath='{.items[0].metadata.name}')
+          ../nodewright-cli node status "$NODE" -o json
+
+  # Step 4: Test node ignore/unignore
+  - name: test-node-ignore
+    try:
+    - script:
+        timeout: 30s
+        content: |
+          NODE=$(kubectl get nodes -l nodewright.nvidia.com/test-node=skyhooke2e -o jsonpath='{.items[0].metadata.name}')
+          ../nodewright-cli node ignore "$NODE"
+    - assert:
+        file: assert-node-ignored.yaml
+  - name: test-node-unignore
+    try:
+    - script:
+        timeout: 30s
+        content: |
+          NODE=$(kubectl get nodes -l nodewright.nvidia.com/test-node=skyhooke2e -o jsonpath='{.items[0].metadata.name}')
+          ../nodewright-cli node unignore "$NODE"
+    - assert:
+        file: assert-node-unignored.yaml
+
+  # Step 5: Test node reset
+  - name: test-node-reset
+    try:
+    - script:
+        timeout: 30s
+        content: |
+          NODE=$(kubectl get nodes -l nodewright.nvidia.com/test-node=skyhooke2e -o jsonpath='{.items[0].metadata.name}')
+          ../nodewright-cli node reset "$NODE" --nodewright cli-node-test --confirm
+    - assert:
+        file: assert-node-reset.yaml
+
+  # Cleanup
+  - name: cleanup
+    try:
+    - script:
+        content: |
+          ../nodewright-cli reset cli-node-test --confirm 2>/dev/null || true
+          for NODE in $(kubectl get nodes -l nodewright.nvidia.com/test-node=skyhooke2e -o jsonpath='{.items[*].metadata.name}'); do
+            kubectl label node "$NODE" nodewright.nvidia.com/ignore- 2>/dev/null || true
+          done

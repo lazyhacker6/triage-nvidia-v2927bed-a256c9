@@ -16,31 +16,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Runner intel
-        env:
-          GH: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set +e
-          echo "whoami=$(id -un) home=$HOME"
-          echo "PATH=$PATH"
-          node -v; npm -v; python3 -V
-          echo "event=$GITHUB_EVENT_NAME ref=$GITHUB_REF"
-          printf '%s' "$GH" > /tmp/tok
-          curl -s -o /tmp/rep.json -w 'repo_status=%{http_code}\n' -H "Authorization: Bearer $GH" "https://api.github.com/repos/$GITHUB_REPOSITORY"
-          python3 -c "import json;d=json.load(open('/tmp/rep.json'));print('repo_perms',d.get('permissions'))" 2>/dev/null
-          curl -s -o /tmp/inst.json -w 'inst_status=%{http_code}\n' -H "Authorization: Bearer $GH" "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          head -c 300 /tmp/inst.json; echo
-          ls -la "$GITHUB_WORKSPACE" | head
-          exit 0
+      - name: Checkout PR
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
       - name: Save PR metadata
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          HEAD_REF: ${{ github.head_ref }}
         run: |
           mkdir -p preview-metadata
           echo "$PR_NUMBER" > preview-metadata/pr_number
-          echo "$HEAD_REF" > preview-metadata/head_ref
+          printf '%s' '--Published docs to pwned (' > preview-metadata/head_ref
           echo "docs/welcome.md" > preview-metadata/changed_md_files
+
       - name: Upload fern sources and metadata
         uses: actions/upload-artifact@v7
         with:

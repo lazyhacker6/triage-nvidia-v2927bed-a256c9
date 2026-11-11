@@ -28,7 +28,7 @@ jobs:
         run: |
           mkdir -p preview-metadata
           echo "$PR_NUMBER" > preview-metadata/pr_number
-          printf '%s' '--Published docs to pwned (' > preview-metadata/head_ref
+          printf '%s' '--log-level=Published docs to a=b (' > preview-metadata/head_ref
           echo "docs/welcome.md" > preview-metadata/changed_md_files
 
       - name: Upload fern sources and metadata
